@@ -19,7 +19,7 @@ Monitor and manage multiple AI coding agents running across tmux sessions. Curre
 ## Install
 
 ```bash
-git clone https://github.com/YOUR_USER/agent-monitor.git
+git clone https://github.com/Fenho/agent-monitor.git
 cd agent-monitor
 ./install.sh
 ```
