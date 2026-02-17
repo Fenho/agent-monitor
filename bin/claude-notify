@@ -1,0 +1,36 @@
+#!/bin/bash
+# Claude Code notification hook — reads JSON from stdin.
+# Plays sound via afplay (bypasses Focus mode) and sends visual via terminal-notifier.
+
+input=$(cat)
+
+/usr/bin/python3 << 'PYEOF' - "$input"
+import json, sys, subprocess, os
+
+raw = sys.argv[1] if len(sys.argv) > 1 else ""
+try:
+    d = json.loads(raw)
+except Exception:
+    sys.exit(1)
+
+msg = d.get("message", "Claude Code")
+ntype = d.get("notification_type", "")
+
+# Sound files for each notification type (afplay bypasses Focus mode)
+sounds = {
+    "permission_prompt": "/System/Library/Sounds/Ping.aiff",
+    "idle_prompt": "/System/Library/Sounds/Pop.aiff",
+}
+sound = sounds.get(ntype, "/System/Library/Sounds/Blow.aiff")
+
+# Play sound (non-blocking)
+subprocess.Popen(["afplay", sound], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+# Visual notification via terminal-notifier (shows if allowed in Focus mode)
+tn = "/opt/homebrew/bin/terminal-notifier"
+if os.path.exists(tn):
+    subprocess.Popen(
+        [tn, "-title", "Claude Code", "-message", msg, "-group", "claude-code"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+PYEOF

@@ -1,0 +1,329 @@
+#!/bin/bash
+# Claude Code Agent Dashboard — interactive TUI for monitoring Claude agents
+# across tmux sessions. Detects agents via TTY mapping, idle state via CPU usage.
+# Compatible with macOS bash 3.2. Flicker-free. Vim-navigable.
+# Grouped by tmux session.
+
+IDLE_THRESHOLD=1.0
+REFRESH_INTERVAL=5
+
+# Colors & escapes
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+GREEN='\033[32m'
+YELLOW='\033[33m'
+CYAN='\033[36m'
+WHITE='\033[37m'
+BG_BLUE='\033[44m'
+EL='\033[K'
+HOME='\033[H'
+ERASE_DOWN='\033[J'
+
+# Pre-expand ANSI codes for safe %s usage in render
+X_BG_SEL=$(printf '\033[48;5;237m')
+X_RESET=$(printf '\033[0m')
+X_EL=$(printf '\033[K')
+X_BOLD=$(printf '\033[1m')
+X_DIM=$(printf '\033[2m')
+X_GREEN=$(printf '\033[32m')
+X_YELLOW=$(printf '\033[33m')
+X_CYAN=$(printf '\033[36m')
+
+SPINNER=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+SPIN_IDX=0
+
+# Global state
+AGENT_COUNT=0
+SELECTED=1
+FIRST_DRAW=1
+
+# Cached data (newline-separated, indexed 1..N via sed)
+C_LINE1=""       # status line per agent
+C_LINE2=""       # detail line per agent
+C_SESSIONS=""    # session name per agent (for grouping)
+AGENT_PANE_IDS=""
+AGENT_SESSIONS=""
+C_ACTIVE=0
+C_IDLE=0
+
+lookup_tty() {
+  local tty="$1" field="$2"
+  local result
+  result=$(printf '%s\n' "$TMUX_PANES" | grep "^${tty}|" | head -1)
+  if [ -z "$result" ]; then
+    case "$field" in
+      1) printf '' ;;  # session
+      2) printf '' ;;  # window:pane
+      3) printf '' ;;  # pane_id
+    esac
+    return
+  fi
+  case "$field" in
+    1) printf '%s' "$result" | cut -d'|' -f2 ;;                          # session
+    2) printf '%s' "$result" | cut -d'|' -f3,4 | tr '|' ':' ;;          # window:pane
+    3) printf '%s' "$result" | cut -d'|' -f5 ;;                          # pane_id
+  esac
+}
+
+parse_elapsed() {
+  local etime="$1"
+  local days=0 hours=0 mins=0 secs=0
+  if [[ "$etime" == *-* ]]; then
+    days="${etime%%-*}"; etime="${etime#*-}"
+  fi
+  IFS=: read -ra parts <<< "$etime"
+  local n=${#parts[@]}
+  if [ "$n" -eq 3 ]; then
+    hours="${parts[0]}"; mins="${parts[1]}"; secs="${parts[2]}"
+  elif [ "$n" -eq 2 ]; then
+    mins="${parts[0]}"; secs="${parts[1]}"
+  fi
+  days=$((10#$days)); hours=$((10#$hours)); mins=$((10#$mins)); secs=$((10#$secs))
+  if [ "$days" -gt 0 ]; then echo "${days}d ${hours}h"
+  elif [ "$hours" -gt 0 ]; then echo "${hours}h ${mins}m"
+  elif [ "$mins" -gt 0 ]; then echo "${mins}m ${secs}s"
+  else echo "${secs}s"; fi
+}
+
+fetch_agents() {
+  local ps_output
+  ps_output=$(ps -eo pid=,tty=,pcpu=,etime=,comm= 2>/dev/null | grep -E 'claude$' | grep -v grep || true)
+
+  AGENT_COUNT=0
+  C_LINE1=""; C_LINE2=""; C_SESSIONS=""
+  AGENT_PANE_IDS=""; AGENT_SESSIONS=""
+  C_ACTIVE=0; C_IDLE=0
+
+  [ -z "$ps_output" ] && return
+
+  local TMUX_PANES
+  TMUX_PANES=$(tmux list-panes -a -F '#{pane_tty}|#{session_name}|#{window_name}|#{pane_index}|#{pane_id}' 2>/dev/null || true)
+  TMUX_PANES=$(printf '%s\n' "$TMUX_PANES" | sed 's|^/dev/||')
+
+  # Collect raw agent data, then sort by session name
+  local raw_agents=""
+  while read -r agent_line; do
+    local pid tty cpu etime
+    pid=$(printf '%s' "$agent_line" | awk '{print $1}')
+    tty=$(printf '%s' "$agent_line" | awk '{print $2}')
+    cpu=$(printf '%s' "$agent_line" | awk '{print $3}')
+    etime=$(printf '%s' "$agent_line" | awk '{print $4}')
+
+    local session winpane pane_id
+    session=$(lookup_tty "$tty" 1)
+    winpane=$(lookup_tty "$tty" 2)
+    pane_id=$(lookup_tty "$tty" 3)
+
+    [ -z "$session" ] && session="unknown"
+    [ -z "$winpane" ] && winpane="?"
+
+    # Encode as a pipe-delimited record for sorting
+    if [ -z "$raw_agents" ]; then
+      raw_agents="${session}|${winpane}|${pid}|${cpu}|${etime}|${pane_id}"
+    else
+      raw_agents="${raw_agents}
+${session}|${winpane}|${pid}|${cpu}|${etime}|${pane_id}"
+    fi
+  done <<< "$ps_output"
+
+  # Sort by session name then window name
+  raw_agents=$(printf '%s\n' "$raw_agents" | sort -t'|' -k1,1 -k2,2)
+
+  # Build cached display data from sorted agents
+  while IFS='|' read -r session winpane pid cpu etime pane_id; do
+    AGENT_COUNT=$((AGENT_COUNT + 1))
+
+    # Navigation data
+    if [ "$AGENT_COUNT" -eq 1 ]; then
+      AGENT_PANE_IDS="$pane_id"
+      AGENT_SESSIONS="$session"
+      C_SESSIONS="$session"
+    else
+      AGENT_PANE_IDS="${AGENT_PANE_IDS}
+${pane_id}"
+      AGENT_SESSIONS="${AGENT_SESSIONS}
+${session}"
+      C_SESSIONS="${C_SESSIONS}
+${session}"
+    fi
+
+    local is_idle
+    is_idle=$(awk "BEGIN { print ($cpu < $IDLE_THRESHOLD) ? 1 : 0 }")
+
+    local has_children tool_tag=""
+    has_children=$(pgrep -P "$pid" 2>/dev/null | head -1 || true)
+    [ -n "$has_children" ] && tool_tag=" ${X_CYAN}[running tool]${X_RESET}"
+
+    local status_label status_color indicator
+    if [ "$is_idle" -eq 1 ] && [ -z "$has_children" ]; then
+      status_label="IDLE"; status_color="$X_YELLOW"; indicator="${X_YELLOW}○${X_RESET}"
+      C_IDLE=$((C_IDLE + 1))
+    else
+      status_label="ACTIVE"; status_color="$X_GREEN"; indicator="${X_GREEN}●${X_RESET}"
+      C_ACTIVE=$((C_ACTIVE + 1))
+    fi
+
+    local activity_str
+    activity_str=$(parse_elapsed "$etime")
+
+    local l1 l2
+    l1="  ${X_BOLD}[${AGENT_COUNT}]${X_RESET}  ${indicator} ${status_color}${X_BOLD}${status_label}${X_RESET}   ${winpane}${tool_tag}"
+    l2=$(printf '       %sPID %-8s CPU %5.1f%%  Uptime: %s%s' "$X_DIM" "$pid" "$cpu" "$activity_str" "$X_RESET")
+
+    if [ "$AGENT_COUNT" -eq 1 ]; then
+      C_LINE1="$l1"; C_LINE2="$l2"
+    else
+      C_LINE1="${C_LINE1}
+${l1}"
+      C_LINE2="${C_LINE2}
+${l2}"
+    fi
+  done <<< "$raw_agents"
+
+  # Clamp selection
+  if [ "$SELECTED" -gt "$AGENT_COUNT" ]; then SELECTED=$AGENT_COUNT; fi
+  if [ "$SELECTED" -lt 1 ] && [ "$AGENT_COUNT" -gt 0 ]; then SELECTED=1; fi
+}
+
+render() {
+  if [ "$FIRST_DRAW" -eq 1 ]; then
+    clear
+    FIRST_DRAW=0
+  else
+    printf "${HOME}"
+  fi
+
+  local spin="${SPINNER[$SPIN_IDX]}"
+  SPIN_IDX=$(( (SPIN_IDX + 1) % ${#SPINNER[@]} ))
+
+  printf "${EL}\n"
+  printf "  ${BG_BLUE}${WHITE}${BOLD}                                                                ${RESET}${EL}\n"
+  printf "  ${BG_BLUE}${WHITE}${BOLD}              Claude Code Agent Dashboard                       ${RESET}${EL}\n"
+  printf "  ${BG_BLUE}${WHITE}${BOLD}                                                                ${RESET}${EL}\n"
+  printf "${EL}\n"
+
+  if [ "$AGENT_COUNT" -eq 0 ]; then
+    printf "  ${DIM}No Claude Code agents detected.${RESET}${EL}\n"
+    printf "${EL}\n"
+    printf "  ${DIM}Start a Claude session in a tmux pane to see it here.${RESET}${EL}\n"
+    printf "${EL}\n"
+    printf "  ${BOLD}[r]${RESET} Refresh  ${BOLD}[q]${RESET} Quit${EL}\n"
+    printf "  ${DIM}${spin} Auto-refresh every ${REFRESH_INTERVAL}s | $(date +%H:%M:%S)${RESET}${EL}\n"
+    printf "${ERASE_DOWN}"
+    return
+  fi
+
+  local prev_session="" i=1
+  while [ "$i" -le "$AGENT_COUNT" ]; do
+    local l1 l2 sess
+    l1=$(printf '%s\n' "$C_LINE1" | sed -n "${i}p")
+    l2=$(printf '%s\n' "$C_LINE2" | sed -n "${i}p")
+    sess=$(printf '%s\n' "$C_SESSIONS" | sed -n "${i}p")
+
+    # Session header when group changes
+    if [ "$sess" != "$prev_session" ]; then
+      if [ -n "$prev_session" ]; then
+        printf '\033[K\n'  # blank line between sections
+      fi
+      printf '  \033[1m┌ %s \033[2m%s\033[0m\033[K\n' "$sess" "────────────────────────────────────────"
+      prev_session="$sess"
+    fi
+
+    if [ "$i" -eq "$SELECTED" ]; then
+      printf '%s  │%s%s\033[K\n' "$X_BG_SEL" "$l1" "$X_RESET"
+      printf '%s  │%s%s\033[K\n' "$X_BG_SEL" "$l2" "$X_RESET"
+    else
+      printf '  │%s\033[K\n' "$l1"
+      printf '  │%s\033[K\n' "$l2"
+    fi
+
+    i=$((i + 1))
+  done
+
+  printf '\033[K\n'
+  printf "  ${DIM}────────────────────────────────────────────────────────${RESET}${EL}\n"
+  printf "  ${BOLD}Total:${RESET} ${AGENT_COUNT} agents  ${GREEN}${C_ACTIVE} active${RESET}  ${YELLOW}${C_IDLE} idle${RESET}${EL}\n"
+  printf "${EL}\n"
+
+  printf "  ${BOLD}j/k${RESET} Navigate  ${BOLD}Enter${RESET} Jump  ${BOLD}[1-9]${RESET} Direct  ${BOLD}r${RESET} Refresh  ${BOLD}q${RESET} Quit${EL}\n"
+  printf "  ${DIM}${spin} Auto-refresh every ${REFRESH_INTERVAL}s | $(date +%H:%M:%S)${RESET}${EL}\n"
+  printf "${ERASE_DOWN}"
+}
+
+jump_to_agent() {
+  local num="$1"
+  [ "$num" -lt 1 ] || [ "$num" -gt "$AGENT_COUNT" ] && return
+  local pane_id session
+  pane_id=$(printf '%s\n' "$AGENT_PANE_IDS" | sed -n "${num}p")
+  session=$(printf '%s\n' "$AGENT_SESSIONS" | sed -n "${num}p")
+  if [ -n "$pane_id" ] && [ -n "$session" ]; then
+    printf 'switch-client -t "%s"\nselect-window -t "%s"\nselect-pane -t "%s"\n' \
+      "$session" "$pane_id" "$pane_id" > /tmp/.claude-dashboard-jump
+    exit 0
+  fi
+}
+
+nav_down() {
+  [ "$AGENT_COUNT" -eq 0 ] && return
+  SELECTED=$(( SELECTED % AGENT_COUNT + 1 ))
+}
+
+nav_up() {
+  [ "$AGENT_COUNT" -eq 0 ] && return
+  SELECTED=$(( (SELECTED - 2 + AGENT_COUNT) % AGENT_COUNT + 1 ))
+}
+
+main() {
+  tput civis 2>/dev/null || true
+  trap 'tput cnorm 2>/dev/null || true' EXIT
+
+  fetch_agents
+  render
+
+  while true; do
+    key=""
+    read -rsn1 -t "$REFRESH_INTERVAL" key 2>/dev/null
+    local rc=$?
+
+    # Timeout (rc > 128) → auto-refresh
+    if [ $rc -gt 128 ]; then
+      fetch_agents; render
+      continue
+    fi
+
+    case "$key" in
+      q|Q) exit 0 ;;
+      r|R) fetch_agents; render ;;
+      j) nav_down; render ;;
+      k) nav_up; render ;;
+      G) [ "$AGENT_COUNT" -gt 0 ] && SELECTED=$AGENT_COUNT; render ;;
+      g)
+        g2=""
+        read -rsn1 -t 0.5 g2 2>/dev/null || true
+        [ "$g2" = "g" ] && [ "$AGENT_COUNT" -gt 0 ] && SELECTED=1
+        render
+        ;;
+      "")
+        # Enter key — jump to selected agent
+        if [ "$AGENT_COUNT" -gt 0 ]; then
+          jump_to_agent "$SELECTED"
+        fi
+        ;;
+      $'\x1b')
+        seq1="" seq2=""
+        read -rsn1 -t 0.1 seq1 2>/dev/null || true
+        if [ "$seq1" = "[" ]; then
+          read -rsn1 -t 0.1 seq2 2>/dev/null || true
+          case "$seq2" in
+            A) nav_up ;; B) nav_down ;;
+          esac
+        fi
+        render
+        ;;
+      [1-9]) jump_to_agent "$key" ;;
+    esac
+  done
+}
+
+main
