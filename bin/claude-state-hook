@@ -1,0 +1,49 @@
+#!/bin/bash
+# Claude Code state hook — tracks agent state for the dashboard.
+# Writes state to /tmp/claude-agent-states/<session_id>.
+# Fires on: UserPromptSubmit, PostToolUse, Stop, Notification, SessionEnd.
+
+STATE_DIR="/tmp/claude-agent-states"
+mkdir -p "$STATE_DIR"
+
+input=$(head -c 4096)
+
+# Simple JSON string field extraction (top-level only)
+json_str() {
+  printf '%s' "$input" | grep -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -1 | sed 's/.*:[[:space:]]*"//;s/"$//'
+}
+
+session_id=$(json_str session_id)
+[ -z "$session_id" ] && exit 0
+
+event=$(json_str hook_event_name)
+
+case "$event" in
+  UserPromptSubmit|PostToolUse)
+    state="thinking"
+    ;;
+  Stop)
+    state="idle"
+    ;;
+  Notification)
+    ntype=$(json_str notification_type)
+    case "$ntype" in
+      permission_prompt) state="waiting" ;;
+      idle_prompt) state="idle" ;;
+      *) exit 0 ;;
+    esac
+    ;;
+  SessionEnd)
+    rm -f "$STATE_DIR/$session_id"
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+
+# Get TTY of current process (inherited from Claude)
+agent_tty=$(ps -o tty= -p $$ 2>/dev/null | tr -d ' ')
+[ -z "$agent_tty" ] || [ "$agent_tty" = "??" ] && exit 0
+
+printf '%s\n%s\n' "$state" "$agent_tty" > "$STATE_DIR/$session_id"

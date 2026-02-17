@@ -4,7 +4,8 @@ Monitor and manage multiple AI coding agents running across tmux sessions. Curre
 
 ## What it does
 
-- **Dashboard** (`prefix + a`): Interactive TUI showing all Claude agents grouped by tmux session. Navigate with vim bindings, press Enter or a number key to jump directly to any agent's pane.
+- **Dashboard** (`prefix + a`): Interactive TUI showing all Claude agents as side-by-side session columns. Navigate with vim bindings (h/j/k/l), jump to any agent by typing its `[session][row]` shortcut.
+- **State tracking**: Real-time agent status via Claude Code hooks — thinking, waiting for input, or idle.
 - **Notifications**: Sound alerts when an agent needs attention (`permission_prompt`, `idle_prompt`). Uses `afplay` which bypasses macOS Focus mode.
 - **tmux flags**: Windows with idle agents get flagged in the tmux status bar via `monitor-silence`.
 
@@ -24,9 +25,9 @@ cd agent-monitor
 ```
 
 The install script:
-1. Copies `claude-dashboard` and `claude-notify` to `~/.local/bin/`
+1. Copies `claude-dashboard`, `claude-notify`, and `claude-state-hook` to `~/.local/bin/`
 2. Appends agent monitoring config to `~/.tmux.conf`
-3. Adds a notification hook to `~/.claude/settings.json`
+3. Configures Claude Code hooks in `~/.claude/settings.json` for notifications and state tracking
 
 After installing, reload tmux: `tmux source-file ~/.tmux.conf`
 
@@ -37,42 +38,57 @@ After installing, reload tmux: `tmux source-file ~/.tmux.conf`
 Press `prefix + a` to open the dashboard as a tmux popup.
 
 ```
-  ┌ main ────────────────────────────────────────
-  │  [1]  ACTIVE   nvim:2 [running tool]
-  │       PID 65078   CPU  5.2%  Uptime: 12m 3s
-  │  [2]   IDLE    back:1
-  │       PID 85490   CPU  0.1%  Uptime: 1m 5s
+  ┌ 1 main (flows)      ┌ 2 reviewing         ┌ 3 sidequest
+  │ [11] ● THINKING     │ [21] ○ IDLE          │ [31] ? UNKNOWN
+  │   monitor:1  5m     │   back:2  25m        │   back:1  1d 1h
+  │ [12] ○ IDLE         │ [22] ○ IDLE          │ [32] ? UNKNOWN
+  │   back:2  57m       │   front:1  3h 12m    │   front:0  23h 43m
+  │ [13] ? UNKNOWN      │                      │
+  │   config:1  1d 6h   │                      │
+  │ [14] ◆ WAITING      │                      │
+  │   front:1  19h 54m  │                      │
 
-  ┌ review ──────────────────────────────────────
-  │  [3]  ACTIVE   pr-42:0
-  │       PID 91234   CPU  8.3%  Uptime: 3m 22s
+  Total: 8 agents  0 thinking  1 waiting  7 idle
 
-  Total: 3 agents  2 active  1 idle
-
-  j/k Navigate  Enter Jump  [1-9] Direct  r Refresh  q Quit
+  h/j/k/l Nav  Enter Jump  [S][R] Direct  r Refresh  q Quit
 ```
+
+Sessions are displayed as side-by-side columns (up to 4 per row). Each agent shows its status, window:pane, and uptime.
 
 | Key | Action |
 |-----|--------|
-| `j` / `k` / arrows | Navigate between agents |
+| `h` / `l` / left / right | Navigate between sessions |
+| `j` / `k` / up / down | Navigate between agents within a session |
 | `Enter` | Jump to selected agent's tmux pane |
-| `1`-`9` | Jump directly to agent N |
-| `gg` / `G` | First / last agent |
+| `[S][R]` (e.g. `12`) | Jump to session S, row R |
+| `gg` / `G` | First / last agent in current session |
 | `r` | Manual refresh |
 | `q` | Quit |
+
+### Agent states
+
+| Icon | State | Meaning |
+|------|-------|---------|
+| `●` | THINKING | Agent is processing (green) |
+| `◆` | WAITING | Agent needs input/approval (yellow) |
+| `○` | IDLE | Agent is idle (dim) |
+| `?` | UNKNOWN | No state hook data available (dim) |
+
+States are tracked via `claude-state-hook`, which writes to `/tmp/claude-agent-states/` on each hook event. Hooks only apply to Claude sessions started after installation.
 
 ### Notifications
 
 Agents trigger sound alerts automatically when they need input:
-- **Permission prompt** (Ping sound) - agent is waiting for tool approval
-- **Idle prompt** (Pop sound) - agent is waiting for your input
+- **Permission prompt** (Ping sound) — agent is waiting for tool approval
+- **Idle prompt** (Pop sound) — agent is waiting for your input
 
 Hooks are configured in `~/.claude/settings.json` and only apply to new Claude sessions.
 
 ## Uninstall
 
 ```bash
-rm ~/.local/bin/claude-dashboard ~/.local/bin/claude-notify
+rm ~/.local/bin/claude-dashboard ~/.local/bin/claude-notify ~/.local/bin/claude-state-hook
+rm -rf /tmp/claude-agent-states
 ```
 
-Then remove the `# agent-monitor` block from `~/.tmux.conf` and the `hooks` block from `~/.claude/settings.json`.
+Then remove the `# agent-monitor` block from `~/.tmux.conf` and the hook entries from `~/.claude/settings.json`.
