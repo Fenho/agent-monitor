@@ -4,9 +4,12 @@ Monitor and manage multiple AI coding agents running across tmux sessions. Curre
 
 ## What it does
 
-- **Dashboard** (`prefix + a`): Interactive TUI showing all Claude agents as side-by-side session columns. Navigate with vim bindings (h/j/k/l), jump to any agent by typing its `[session][row]` shortcut.
-- **State tracking**: Real-time agent status via Claude Code hooks — thinking, waiting for input, or idle.
-- **Notifications**: Sound alerts when an agent needs attention (`permission_prompt`, `idle_prompt`). Uses `afplay` which bypasses macOS Focus mode.
+- **Dashboard** (`prefix + a`): Interactive TUI showing all Claude agents as side-by-side session columns with vim navigation.
+- **State tracking**: Real-time agent status via Claude Code hooks — thinking, waiting, done, or idle.
+- **Urgency coloring**: Waiting agents escalate from yellow → orange → red over time. Done (unseen idle) agents escalate from magenta → yellow → orange → red.
+- **Inline send**: Preview an agent's last output and send a message without leaving the dashboard.
+- **Tracker popup**: Quick-access markdown tracker via tmux popup overlay.
+- **Notifications**: Sound alerts when agents need attention. Terminal bell on state transitions. Uses `afplay` which bypasses macOS Focus mode.
 - **tmux flags**: Windows with idle agents get flagged in the tmux status bar via `monitor-silence`.
 
 ## Requirements
@@ -38,22 +41,20 @@ After installing, reload tmux: `tmux source-file ~/.tmux.conf`
 Press `prefix + a` to open the dashboard as a tmux popup.
 
 ```
-  ┌ 1 main (flows)      ┌ 2 reviewing         ┌ 3 sidequest
-  │ [11] ● THINKING     │ [21] ○ IDLE          │ [31] ? UNKNOWN
-  │   monitor:1  5m     │   back:2  25m        │   back:1  1d 1h
-  │ [12] ○ IDLE         │ [22] ○ IDLE          │ [32] ? UNKNOWN
-  │   back:2  57m       │   front:1  3h 12m    │   front:0  23h 43m
-  │ [13] ? UNKNOWN      │                      │
-  │   config:1  1d 6h   │                      │
-  │ [14] ◆ WAITING      │                      │
-  │   front:1  19h 54m  │                      │
+  ┌ 1 flows  ▓▓░ 2●1◆      ┌ 2 reviewing  ░░ 2○
+  │ ▸ monitor                │ ▸ back
+  │ [11] ● THINKING    5m   │ [21] ○ IDLE       25m
+  │ ▸ back                   │ ▸ front
+  │ [12] ✓ DONE        2m   │ [22] ○ IDLE       3h
+  │ ▸ front                  │
+  │ [13] ◆ WAITING     8m   │
 
-  Total: 8 agents  0 thinking  1 waiting  7 idle
+  Total: 5 agents  1 thinking  1 waiting  3 idle
 
-  h/j/k/l Nav  Enter Jump  [S][R] Direct  r Refresh  q Quit
+  h/j/k/l Nav  Enter Jump  [S][R] Direct  s Send  t Tracker  r Refresh  q Quit
 ```
 
-Sessions are displayed as side-by-side columns (up to 4 per row). Each agent shows its status, window:pane, and uptime.
+Sessions are displayed as side-by-side columns (up to 4 per row). Each session header includes a productivity bar and state counts. Agents are grouped under their tmux window name.
 
 | Key | Action |
 |-----|--------|
@@ -62,19 +63,36 @@ Sessions are displayed as side-by-side columns (up to 4 per row). Each agent sho
 | `Enter` | Jump to selected agent's tmux pane |
 | `[S][R]` (e.g. `12`) | Jump to session S, row R |
 | `gg` / `G` | First / last agent in current session |
+| `s` | Send a message to the selected agent (shows output preview) |
+| `t` | Open tracker file in a tmux popup |
 | `r` | Manual refresh |
 | `q` | Quit |
 
 ### Agent states
 
-| Icon | State | Meaning |
-|------|-------|---------|
-| `●` | THINKING | Agent is processing (green) |
-| `◆` | WAITING | Agent needs input/approval (yellow) |
-| `○` | IDLE | Agent is idle (dim) |
-| `?` | UNKNOWN | No state hook data available (dim) |
+| Icon | State | Color | Meaning |
+|------|-------|-------|---------|
+| `●` | THINKING | Green | Agent is processing |
+| `◆` | WAITING | Yellow → Orange → Red | Agent needs input/approval (escalates over time) |
+| `✓` | DONE | Magenta → Yellow → Orange → Red | Agent finished but you haven't seen it yet |
+| `○` | IDLE | Dim | Agent is idle (acknowledged) |
+| `?` | UNKNOWN | Dim | No state hook data available |
+
+DONE clears automatically when you jump to the agent from the dashboard, or when the agent's tmux pane is currently visible (checked every refresh cycle).
 
 States are tracked via `claude-state-hook`, which writes to `/tmp/claude-agent-states/` on each hook event. Hooks only apply to Claude sessions started after installation.
+
+### Configuration
+
+These variables at the top of `claude-dashboard` can be customized:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `REFRESH_INTERVAL` | `5` | Seconds between auto-refresh |
+| `STATE_DIR` | `/tmp/claude-agent-states` | Where state hook writes agent states |
+| `TRACKER_FILE` | `$HOME/Documents/notes/tracker.md` | Markdown file opened by the `t` key |
+| `MAX_COLS` | `4` | Max session columns per row |
+| `MIN_COL_W` | `30` | Minimum column width in characters |
 
 ### Notifications
 
