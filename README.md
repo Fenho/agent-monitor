@@ -51,10 +51,10 @@ Press `prefix + a` to open the dashboard as a tmux popup.
 
   Total: 5 agents  1 thinking  1 waiting  3 idle
 
-  h/j/k/l Nav  Enter Jump  [S][R] Direct  s Send  t Tracker  r Refresh  q Quit
+  h/j/k/l Nav  Enter Jump  [S][R] Direct  m Mark  s Send  t Tracker  r Refresh  q Quit
 ```
 
-Sessions are displayed as side-by-side columns (up to 4 per row). Each session header includes a productivity bar and state counts. Agents are grouped under their tmux window name.
+Sessions are displayed as side-by-side columns (dynamically sized to fit the terminal). Each session header includes a productivity bar and state counts. Agents are grouped under their tmux window name.
 
 | Key | Action |
 |-----|--------|
@@ -63,8 +63,9 @@ Sessions are displayed as side-by-side columns (up to 4 per row). Each session h
 | `Enter` | Jump to selected agent's tmux pane |
 | `[S][R]` (e.g. `12`) | Jump to session S, row R |
 | `gg` / `G` | First / last agent in current session |
+| `m` | Toggle mark on the selected agent (persists across refreshes) |
 | `s` | Send a message to the selected agent (shows output preview) |
-| `t` | Open tracker file in a tmux popup |
+| `t` | Open tracker file in `$EDITOR` |
 | `r` | Manual refresh |
 | `q` | Quit |
 
@@ -90,8 +91,7 @@ These variables at the top of `claude-dashboard` can be customized:
 |----------|---------|-------------|
 | `REFRESH_INTERVAL` | `5` | Seconds between auto-refresh |
 | `STATE_DIR` | `/tmp/claude-agent-states` | Where state hook writes agent states |
-| `TRACKER_FILE` | `$HOME/Documents/notes/tracker.md` | Markdown file opened by the `t` key |
-| `MAX_COLS` | `4` | Max session columns per row |
+| `TRACKER_FILE` | `$HOME/.local/share/agent-monitor/tracker.md` | Markdown file opened by the `t` key (auto-created) |
 | `MIN_COL_W` | `30` | Minimum column width in characters |
 
 ### Notifications

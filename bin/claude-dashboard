@@ -6,8 +6,10 @@
 
 REFRESH_INTERVAL=5
 STATE_DIR="/tmp/claude-agent-states"
-TRACKER_FILE="$HOME/Documents/notes/tracker.md"
-MAX_COLS=4
+DATA_DIR="$HOME/.local/share/agent-monitor"
+TRACKER_FILE="$DATA_DIR/tracker.md"
+mkdir -p "$DATA_DIR"
+[ -f "$TRACKER_FILE" ] || printf '# Agent Tracker\n\n' > "$TRACKER_FILE"
 MIN_COL_W=30
 
 # Colors & escapes
@@ -34,6 +36,8 @@ X_CYAN=$(printf '\033[36m')
 X_ORANGE=$(printf '\033[38;5;208m')
 X_RED=$(printf '\033[31m')
 X_MAGENTA=$(printf '\033[35m')
+X_BG_MARK=$(printf '\033[48;5;53m')
+X_BG_MARK_DIM=$(printf '\033[48;5;54m')
 
 SPINNER=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
 SPIN_IDX=0
@@ -243,15 +247,6 @@ ${session}|${winpane}|${pid}|${cpu}|${etime}|${pane_id}|${tty}"
     local agent_state
     agent_state=$(get_agent_state "$tty")
 
-    # CPU-based fallback: if state file says idle/unknown but process is
-    # burning CPU, the hook missed a transition — override to thinking
-    if [ "$agent_state" != "thinking" ] && [ "$agent_state" != "waiting" ]; then
-      local cpu_int="${cpu%.*}"
-      if [ "${cpu_int:-0}" -gt 2 ]; then
-        agent_state="thinking"
-      fi
-    fi
-
     A_STATE+=("$agent_state")
     A_WINPANE+=("$winpane")
     A_TTY+=("$tty")
@@ -458,7 +453,11 @@ build_render_items() {
 PREV_STATE_FILE="/tmp/claude-dashboard-prev-states"
 EVENT_LOG_FILE="/tmp/claude-dashboard-event-log"
 NOTIF_FILE="/tmp/claude-dashboard-notifs"
+SELECTED_FILE="/tmp/claude-dashboard-selected"
 NOTIF_TTYS=()
+
+MARK_FILE="/tmp/claude-dashboard-marks"
+MARK_TTYS=()
 
 load_notifications() {
   NOTIF_TTYS=()
@@ -503,6 +502,47 @@ remove_notification() {
   done
   NOTIF_TTYS=("${new_list[@]}")
   save_notifications
+}
+
+load_marks() {
+  MARK_TTYS=()
+  [ -f "$MARK_FILE" ] || return
+  while IFS= read -r mtty; do
+    [ -n "$mtty" ] && MARK_TTYS+=("$mtty")
+  done < "$MARK_FILE"
+}
+
+save_marks() {
+  : > "$MARK_FILE"
+  local i=0
+  while [ "$i" -lt "${#MARK_TTYS[@]}" ]; do
+    printf '%s\n' "${MARK_TTYS[$i]}" >> "$MARK_FILE"
+    i=$((i + 1))
+  done
+}
+
+has_mark() {
+  local tty="$1" i=0
+  while [ "$i" -lt "${#MARK_TTYS[@]}" ]; do
+    [ "${MARK_TTYS[$i]}" = "$tty" ] && return 0
+    i=$((i + 1))
+  done
+  return 1
+}
+
+toggle_mark() {
+  local tty="$1"
+  if has_mark "$tty"; then
+    local new_list=() i=0
+    while [ "$i" -lt "${#MARK_TTYS[@]}" ]; do
+      [ "${MARK_TTYS[$i]}" != "$tty" ] && new_list+=("${MARK_TTYS[$i]}")
+      i=$((i + 1))
+    done
+    MARK_TTYS=("${new_list[@]}")
+  else
+    MARK_TTYS+=("$tty")
+  fi
+  save_marks
 }
 
 load_event_log() {
@@ -653,18 +693,34 @@ print_agent_line() {
     *)        ic="?"; label="UNKNOWN";  color="$X_DIM" ;;
   esac
 
-  local left_len=$(( 2 + ${#row_label} + 1 + 1 + 1 + ${#label} ))
+  local marked=0
+  has_mark "${A_TTY[$idx]}" && marked=1
+
+  local mark_prefix=""
+  [ "$marked" -eq 1 ] && mark_prefix="★ "
+
+  local left_len=$(( 2 + ${#row_label} + 1 + ${#mark_prefix} + 1 + 1 + ${#label} ))
   local gap=$(( cw - left_len - ${#up} ))
   [ "$gap" -lt 1 ] && gap=1
 
   local bg_on="" RST="$X_RESET"
-  if [ "$hl" -eq 1 ]; then
+  if [ "$hl" -eq 1 ] && [ "$marked" -eq 1 ]; then
+    bg_on="$X_BG_MARK"; RST="${X_RESET}${X_BG_MARK}"
+  elif [ "$hl" -eq 1 ]; then
     bg_on="$X_BG_SEL"; RST="${X_RESET}${X_BG_SEL}"
+  elif [ "$marked" -eq 1 ]; then
+    bg_on="$X_BG_MARK_DIM"; RST="${X_RESET}${X_BG_MARK_DIM}"
   fi
 
-  printf '%s  %s %s%s%s %s%s%s%s%*s%s%s%s' \
+  local mark_display=""
+  if [ "$marked" -eq 1 ]; then
+    mark_display="${X_YELLOW}${X_BOLD}★${RST} "
+  fi
+
+  printf '%s  %s %s%s%s%s %s%s%s%s%*s%s%s%s' \
     "$bg_on" \
     "$row_label" \
+    "$mark_display" \
     "$color" "$ic" "$RST" \
     "$color" "$X_BOLD" "$label" "$RST" \
     "$gap" "" \
@@ -705,9 +761,11 @@ render() {
   local spin="${SPINNER[$SPIN_IDX]}"
   SPIN_IDX=$(( (SPIN_IDX + 1) % ${#SPINNER[@]} ))
 
-  # Terminal width
+  # Terminal width (stty is more reliable inside tmux popups)
   local tw
-  tw=$(tput cols 2>/dev/null) || tw=80
+  tw=$(stty size 2>/dev/null | awk '{print $2}') || tw=80
+  [ -z "$tw" ] || [ "$tw" -eq 0 ] 2>/dev/null && tw=$(tput cols 2>/dev/null) || true
+  [ -z "$tw" ] || [ "$tw" -eq 0 ] 2>/dev/null && tw=80
 
   printf "${EL}\n"
   printf "  ${BOLD}\033[7m  Agent Dashboard  ${RESET}${EL}\n"
@@ -726,19 +784,21 @@ render() {
 
   local total_sessions=${#SESS_NAMES[@]}
 
-  # Render session columns in groups of MAX_COLS
+  # Compute max columns that fit at MIN_COL_W
+  local max_cols=$(( (tw - 2) / MIN_COL_W ))
+  [ "$max_cols" -lt 1 ] && max_cols=1
+
+  # Render session columns in groups of max_cols
   local group=0
   while [ "$group" -lt "$total_sessions" ]; do
-    local group_end=$((group + MAX_COLS))
-    [ "$group_end" -gt "$total_sessions" ] && group_end=$total_sessions
-    local ncols=$((group_end - group))
+    local remaining=$((total_sessions - group))
+    local ncols=$remaining
+    [ "$ncols" -gt "$max_cols" ] && ncols=$max_cols
+
+    local group_end=$((group + ncols))
 
     # Column width: divide terminal evenly across session columns
     local cw=$(( (tw - 2) / ncols ))
-    while [ "$cw" -lt "$MIN_COL_W" ] && [ "$ncols" -gt 1 ]; do
-      ncols=$((ncols - 1))
-      cw=$(( (tw - 2) / ncols ))
-    done
 
     # Find max render lines in this group of sessions
     local max_lines=0 c=$group
@@ -760,7 +820,22 @@ render() {
         printf '  '
       fi
 
-      local prefix="┌ ${snum} ${sname}  "
+      # Compute suffix length: bar + space + counts
+      local suffix_len=$((st + sw + sid + 1))
+      [ "$st" -gt 0 ] && suffix_len=$((suffix_len + ${#st} + 1))
+      [ "$sw" -gt 0 ] && suffix_len=$((suffix_len + ${#sw} + 1))
+      [ "$sid" -gt 0 ] && suffix_len=$((suffix_len + ${#sid} + 1))
+
+      # Truncate session name if it would overflow the column
+      local fixed_len=$(( 2 + ${#snum} + 1 + 2 ))  # "┌ N " + "  " gap
+      local max_name=$(( cw - fixed_len - suffix_len ))
+      [ "$max_name" -lt 3 ] && max_name=3
+      local dname="$sname"
+      if [ "${#dname}" -gt "$max_name" ]; then
+        dname="${dname:0:$((max_name - 1))}…"
+      fi
+
+      local prefix="┌ ${snum} ${dname}  "
       printf "${BOLD}%s${RESET}" "$prefix"
       local vlen=${#prefix}
 
@@ -858,7 +933,7 @@ render() {
   fi
 
   printf "${EL}\n"
-  printf "  ${BOLD}h/j/k/l${RESET} Nav  ${BOLD}Enter${RESET} Jump  ${BOLD}[S][R]${RESET} Direct  ${BOLD}s${RESET} Send  ${BOLD}t${RESET} Tracker  ${BOLD}r${RESET} Refresh  ${BOLD}q${RESET} Quit${EL}\n"
+  printf "  ${BOLD}h/j/k/l${RESET} Nav  ${BOLD}Enter${RESET} Jump  ${BOLD}[S][R]${RESET} Direct  ${BOLD}m${RESET} Mark  ${BOLD}s${RESET} Send  ${BOLD}t${RESET} Tracker  ${BOLD}r${RESET} Refresh  ${BOLD}q${RESET} Quit${EL}\n"
   printf "  ${DIM}${spin} Auto-refresh every ${REFRESH_INTERVAL}s | $(date +%H:%M:%S)${RESET}${EL}\n"
   printf "${ERASE_DOWN}"
 }
@@ -867,7 +942,9 @@ jump_to_agent() {
   local num="$1"
   [ "$num" -lt 1 ] || [ "$num" -gt "$AGENT_COUNT" ] && return
   local idx=$((num - 1))
+  SELECTED=$num
   remove_notification "${A_TTY[$idx]}"
+  save_selected
   local pane_id="${AGENT_PANE_IDS[$idx]}"
   local session="${AGENT_SESSIONS[$idx]}"
   if [ -n "$pane_id" ] && [ -n "$session" ]; then
@@ -1014,7 +1091,8 @@ send_to_agent() {
   [ -z "$preview" ] && preview="(empty pane)"
 
   local tw
-  tw=$(tput cols 2>/dev/null) || tw=80
+  tw=$(stty size 2>/dev/null | awk '{print $2}') || tw=80
+  [ -z "$tw" ] || [ "$tw" -eq 0 ] 2>/dev/null && tw=80
   local dw=$((tw - 4))
 
   clear
@@ -1077,7 +1155,27 @@ send_to_agent() {
   done
 }
 
+save_selected() {
+  [ "$AGENT_COUNT" -gt 0 ] && printf '%s\n' "${A_TTY[$((SELECTED - 1))]}" > "$SELECTED_FILE"
+}
+
+restore_selected() {
+  [ -f "$SELECTED_FILE" ] || return
+  local saved_tty
+  read -r saved_tty < "$SELECTED_FILE"
+  [ -z "$saved_tty" ] && return
+  local i=0
+  while [ "$i" -lt "$AGENT_COUNT" ]; do
+    if [ "${A_TTY[$i]}" = "$saved_tty" ]; then
+      SELECTED=$((i + 1))
+      return
+    fi
+    i=$((i + 1))
+  done
+}
+
 cleanup() {
+  save_selected
   tput cnorm 2>/dev/null || true
 }
 
@@ -1088,7 +1186,9 @@ main() {
   trap '' PIPE
 
   load_notifications
+  load_marks
   fetch_agents
+  restore_selected
   build_render_items
   detect_transitions
   clear_seen_notifications
@@ -1131,6 +1231,7 @@ main() {
         k) nav_up; render ;;
         h) nav_left; render ;;
         l) nav_right; render ;;
+        m) [ "$AGENT_COUNT" -gt 0 ] && toggle_mark "${A_TTY[$((SELECTED - 1))]}"; render ;;
         s) send_to_agent; fetch_agents; build_render_items; detect_transitions; clear_seen_notifications; render ;;
         t) tput cnorm 2>/dev/null; "${EDITOR:-vim}" "$TRACKER_FILE"; tput civis 2>/dev/null; FIRST_DRAW=1; render ;;
         G) [ "$AGENT_COUNT" -gt 0 ] && SELECTED=$AGENT_COUNT; render ;;
