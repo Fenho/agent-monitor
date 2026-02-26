@@ -179,13 +179,13 @@ fetch_agents() {
 
   # Single ps call for both agents and apps
   local ps_all
-  ps_all=$(ps -eo tty=,pid=,pcpu=,etime=,comm=,args= 2>/dev/null || true)
+  ps_all=$(ps -eo tty=,pid=,pcpu=,etime=,comm= 2>/dev/null || true)
   local ps_agents
   ps_agents=$(printf '%s\n' "$ps_all" | grep -E ' claude$' | grep -v grep || true)
   [ -z "$ps_agents" ] && return
 
   local ps_apps
-  ps_apps=$(printf '%s\n' "$ps_all" | grep 'pnpm' | grep ' dev' | grep -v grep || true)
+  ps_apps=$(ps -eo tty=,args= 2>/dev/null | grep 'pnpm' | grep ' dev' | grep -v grep || true)
 
   # Build TTY lookup via awk in one pass (avoids per-agent bash loops)
   local tmux_raw
