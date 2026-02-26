@@ -135,34 +135,6 @@ get_state_mtime() {
   printf '0'
 }
 
-lookup_tty() {
-  local tty="$1" field="$2" line
-  for line in "${TMUX_PANE_LINES[@]}"; do
-    if [[ "$line" == "${tty}|"* ]]; then
-      local rest="${line#*|}"
-      case "$field" in
-        1) printf '%s' "${rest%%|*}" ;;
-        2)
-          local after="${rest#*|}"
-          local win="${after%%|*}"
-          after="${after#*|}"
-          printf '%s:%s' "$win" "${after%%|*}"
-          ;;
-        3)
-          local tmp="${rest#*|}"
-          tmp="${tmp#*|}"; tmp="${tmp#*|}"
-          printf '%s' "${tmp%%|*}"
-          ;;
-        4)
-          local w4="${rest#*|}"
-          printf '%s' "${w4%%|*}"
-          ;;
-      esac
-      return
-    fi
-  done
-}
-
 parse_elapsed() {
   local etime="$1"
   local days=0 hours=0 mins=0 secs=0
@@ -197,9 +169,6 @@ format_seconds() {
 }
 
 fetch_agents() {
-  local ps_output
-  ps_output=$(ps -eo pid=,tty=,pcpu=,etime=,comm= 2>/dev/null | grep -E 'claude$' | grep -v grep || true)
-
   AGENT_COUNT=0
   A_STATE=(); A_WINPANE=(); A_UPTIME=(); A_WIN=(); A_TTY=(); A_STATE_SECS=()
   C_SESSIONS=(); AGENT_PANE_IDS=(); AGENT_SESSIONS=()
@@ -208,38 +177,63 @@ fetch_agents() {
   SESS_THINKING=(); SESS_WAITING=(); SESS_IDLE=()
   APP_COUNT=0; APP_SESSION=(); APP_WIN=(); APP_CMD=()
 
-  [ -z "$ps_output" ] && return
+  # Single ps call for both agents and apps
+  local ps_all
+  ps_all=$(ps -eo tty=,pid=,pcpu=,etime=,comm=,args= 2>/dev/null || true)
+  local ps_agents
+  ps_agents=$(printf '%s\n' "$ps_all" | grep -E ' claude$' | grep -v grep || true)
+  [ -z "$ps_agents" ] && return
 
+  local ps_apps
+  ps_apps=$(printf '%s\n' "$ps_all" | grep 'pnpm' | grep ' dev' | grep -v grep || true)
+
+  # Build TTY lookup via awk in one pass (avoids per-agent bash loops)
   local tmux_raw
   tmux_raw=$(tmux list-panes -a -F '#{pane_tty}|#{session_name}|#{window_name}|#{pane_index}|#{pane_id}' 2>/dev/null || true)
 
-  TMUX_PANE_LINES=()
-  while IFS= read -r pane_line; do
-    TMUX_PANE_LINES+=("${pane_line#/dev/}")
-  done <<< "$tmux_raw"
+  # Pre-build lookup arrays: TMUX_LOOKUP_* indexed by tty (via awk output)
+  # Output format: tty|session|win:pane_idx|pane_id|win
+  local lookup_data
+  lookup_data=$(printf '%s\n' "$tmux_raw" | awk -F'|' '{
+    tty = $1; sub(/^\/dev\//, "", tty)
+    print tty "|" $2 "|" $3 ":" $4 "|" $5 "|" $3
+  }')
+
+  # Store lookup as arrays for fast access
+  TMUX_L_TTY=(); TMUX_L_SESS=(); TMUX_L_WINPANE=(); TMUX_L_PANEID=(); TMUX_L_WIN=()
+  while IFS='|' read -r _lt _ls _lwp _lp _lw; do
+    TMUX_L_TTY+=("$_lt")
+    TMUX_L_SESS+=("$_ls")
+    TMUX_L_WINPANE+=("$_lwp")
+    TMUX_L_PANEID+=("$_lp")
+    TMUX_L_WIN+=("$_lw")
+  done <<< "$lookup_data"
+  local tmux_count=${#TMUX_L_TTY[@]}
 
   load_agent_states
 
-  local raw_agents=""
-  while read -r pid tty cpu etime _rest; do
-    local session winpane pane_id
-    session=$(lookup_tty "$tty" 1)
-    winpane=$(lookup_tty "$tty" 2)
-    pane_id=$(lookup_tty "$tty" 3)
+  # Join agents with tmux data via awk instead of per-agent lookup_tty calls
+  local joined
+  joined=$(awk -F'|' '
+    NR == FNR { sess[$1]=$2; wp[$1]=$3":"$4; pid5[$1]=$5; next }
+    {
+      split($0, f, " ")
+      tty = f[1]; sub(/^\/dev\//, "", tty)
+      if (tty in sess)
+        print sess[tty] "|" wp[tty] "|" f[2] "|" f[3] "|" f[4] "|" pid5[tty] "|" tty
+    }
+  ' <(printf '%s\n' "$tmux_raw" | sed 's|^/dev/||') <(printf '%s\n' "$ps_agents") \
+    | sort -t'|' -k1,1 -k2,2)
+
+  [ -z "$joined" ] && return
+
+  local now_epoch
+  now_epoch=$(date +%s)
+
+  while IFS='|' read -r session winpane pid cpu etime pane_id tty; do
     [ -z "$session" ] && session="unknown"
     [ -z "$winpane" ] && winpane="?"
 
-    if [ -z "$raw_agents" ]; then
-      raw_agents="${session}|${winpane}|${pid}|${cpu}|${etime}|${pane_id}|${tty}"
-    else
-      raw_agents="${raw_agents}
-${session}|${winpane}|${pid}|${cpu}|${etime}|${pane_id}|${tty}"
-    fi
-  done <<< "$ps_output"
-
-  raw_agents=$(printf '%s\n' "$raw_agents" | sort -t'|' -k1,1 -k2,2)
-
-  while IFS='|' read -r session winpane pid cpu etime pane_id tty; do
     AGENT_PANE_IDS+=("$pane_id")
     AGENT_SESSIONS+=("$session")
     C_SESSIONS+=("$session")
@@ -250,11 +244,11 @@ ${session}|${winpane}|${pid}|${cpu}|${etime}|${pane_id}|${tty}"
     A_STATE+=("$agent_state")
     A_WINPANE+=("$winpane")
     A_TTY+=("$tty")
+    A_WIN+=("${winpane%%:*}")
 
     # Time-in-current-state from state file mtime; fall back to process uptime
-    local state_mtime now_epoch secs_in_state=0
+    local state_mtime secs_in_state=0
     state_mtime=$(get_state_mtime "$tty")
-    now_epoch=$(date +%s)
     if [ "$state_mtime" -gt 0 ]; then
       secs_in_state=$((now_epoch - state_mtime))
       [ "$secs_in_state" -lt 0 ] && secs_in_state=0
@@ -271,14 +265,7 @@ ${session}|${winpane}|${pid}|${cpu}|${etime}|${pane_id}|${tty}"
     esac
 
     AGENT_COUNT=$((AGENT_COUNT + 1))
-  done <<< "$raw_agents"
-
-  # Extract window name from each agent's winpane (part before colon)
-  local wi=0
-  while [ "$wi" -lt "$AGENT_COUNT" ]; do
-    A_WIN+=("${A_WINPANE[$wi]%%:*}")
-    wi=$((wi + 1))
-  done
+  done <<< "$joined"
 
   # Build session boundary lookup
   local prev="" i=0
@@ -307,24 +294,20 @@ ${session}|${winpane}|${pid}|${cpu}|${etime}|${pane_id}|${tty}"
   if [ "$SELECTED" -lt 1 ] && [ "$AGENT_COUNT" -gt 0 ]; then SELECTED=1; fi
 
   # Detect apps (pnpm dev) — only in sessions that have agents
-  local app_output
-  app_output=$(ps -eo tty=,args= 2>/dev/null | grep 'pnpm' | grep ' dev' | grep -v grep || true)
-  if [ -n "$app_output" ]; then
-    local _seen_ttys=()
-    while read -r atty acmd; do
-      atty="${atty#/dev/}"
-      # Deduplicate by TTY
-      local dup_tty=0 dti=0
-      while [ "$dti" -lt "${#_seen_ttys[@]}" ]; do
-        [ "${_seen_ttys[$dti]}" = "$atty" ] && { dup_tty=1; break; }
-        dti=$((dti + 1))
-      done
-      [ "$dup_tty" -eq 1 ] && continue
-      _seen_ttys+=("$atty")
+  if [ -n "$ps_apps" ]; then
+    # Join apps with tmux data via awk
+    local app_joined
+    app_joined=$(awk -F'|' '
+      NR == FNR { sess[$1]=$2; win[$1]=$3; next }
+      {
+        split($0, f, " ")
+        tty = f[1]; sub(/^\/dev\//, "", tty)
+        if (tty in sess && !seen[tty]++) print sess[tty] "|" win[tty]
+      }
+    ' <(printf '%s\n' "$tmux_raw" | sed 's|^/dev/||' | awk -F'|' '{print $1 "|" $2 "|" $3}') \
+      <(printf '%s\n' "$ps_apps"))
 
-      local asess awin
-      asess=$(lookup_tty "$atty" 1)
-      awin=$(lookup_tty "$atty" 4)
+    while IFS='|' read -r asess awin; do
       [ -z "$asess" ] && continue
       # Only include apps in sessions that have agents
       local found=0 asi=0
@@ -338,7 +321,7 @@ ${session}|${winpane}|${pid}|${cpu}|${etime}|${pane_id}|${tty}"
       APP_WIN+=("${awin:-?}")
       APP_CMD+=("pnpm dev")
       APP_COUNT=$((APP_COUNT + 1))
-    done <<< "$app_output"
+    done <<< "$app_joined"
   fi
 }
 
