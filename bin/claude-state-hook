@@ -43,7 +43,7 @@ case "$event" in
 esac
 
 # Get TTY of current process (inherited from Claude)
-agent_tty=$(ps -o tty= -p $$ 2>/dev/null | tr -d ' ')
+agent_tty=$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' ')
 [ -z "$agent_tty" ] || [ "$agent_tty" = "??" ] && exit 0
 
 printf '%s\n%s\n' "$state" "$agent_tty" > "$STATE_DIR/$session_id"

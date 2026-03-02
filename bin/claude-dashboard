@@ -10,7 +10,8 @@ DATA_DIR="$HOME/.local/share/agent-monitor"
 TRACKER_FILE="$DATA_DIR/tracker.md"
 mkdir -p "$DATA_DIR"
 [ -f "$TRACKER_FILE" ] || printf '# Agent Tracker\n\n' > "$TRACKER_FILE"
-MIN_COL_W=30
+MAX_COLS=8
+MIN_COL_W=14
 
 # Colors & escapes
 BOLD='\033[1m'
@@ -59,6 +60,7 @@ C_WAITING=0
 C_IDLE=0
 A_WIN=()
 A_TTY=()
+A_CWD=()
 A_STATE_SECS=()
 
 # Activity feed & transition tracking
@@ -76,6 +78,7 @@ APP_CMD=()
 # Render items (flat sequence, per-session offsets)
 RENDER_TYPE=()         # "h"=window header, "a"=agent, "p"=app
 RENDER_IDX=()          # agent/app index (for "a"/"p"), window name (for "h")
+RENDER_BRANCH=()       # git branch for "h" items, empty for others
 RENDER_SESS_START=()   # offset into RENDER_* for each session
 RENDER_SESS_COUNT=()   # line count per session
 
@@ -86,6 +89,7 @@ SESS_COUNT=()    # agent count per session
 SESS_THINKING=()
 SESS_WAITING=()
 SESS_IDLE=()
+SESS_ENV=()
 
 # State file lookup (bash 3.2 compatible, no associative arrays)
 STATE_TTYS=()
@@ -135,6 +139,70 @@ get_state_mtime() {
   printf '0'
 }
 
+# Branch cache (parallel arrays, cleared each refresh)
+BRANCH_CACHE_DIRS=()
+BRANCH_CACHE_VALS=()
+
+detect_branch() {
+  local cwd="$1"
+  [ -z "$cwd" ] && return
+  local ci=0
+  while [ "$ci" -lt "${#BRANCH_CACHE_DIRS[@]}" ]; do
+    if [ "${BRANCH_CACHE_DIRS[$ci]}" = "$cwd" ]; then
+      printf '%s' "${BRANCH_CACHE_VALS[$ci]}"
+      return
+    fi
+    ci=$((ci + 1))
+  done
+  local br
+  br=$(git -C "$cwd" branch --show-current 2>/dev/null)
+  BRANCH_CACHE_DIRS+=("$cwd")
+  BRANCH_CACHE_VALS+=("$br")
+  printf '%s' "$br"
+}
+
+# Environment detection — configurable via $DATA_DIR/env-rules
+# Format: one rule per line: KEY=ENV_LABEL (e.g. POSTGRES_HOST=DEV)
+# Checks .env.local in the agent's CWD for matching keys.
+# Default rule if no config file: POSTGRES_HOST=DEV
+ENV_RULES_FILE="$DATA_DIR/env-rules"
+ENV_RULE_KEYS=()
+ENV_RULE_LABELS=()
+
+load_env_rules() {
+  ENV_RULE_KEYS=(); ENV_RULE_LABELS=()
+  if [ -f "$ENV_RULES_FILE" ]; then
+    while IFS='=' read -r rk rl; do
+      [ -z "$rk" ] && continue
+      [[ "$rk" == \#* ]] && continue
+      ENV_RULE_KEYS+=("$rk")
+      ENV_RULE_LABELS+=("$rl")
+    done < "$ENV_RULES_FILE"
+  fi
+  # Default rule if none configured
+  if [ "${#ENV_RULE_KEYS[@]}" -eq 0 ]; then
+    ENV_RULE_KEYS+=("POSTGRES_HOST")
+    ENV_RULE_LABELS+=("DEV")
+  fi
+}
+load_env_rules
+
+detect_env() {
+  local cwd="$1"
+  [ -z "$cwd" ] && return
+  local envfile="${cwd}/.env.local"
+  [ -f "$envfile" ] || return
+  local i=0
+  while [ "$i" -lt "${#ENV_RULE_KEYS[@]}" ]; do
+    if grep -q "^[^#]*${ENV_RULE_KEYS[$i]}" "$envfile" 2>/dev/null; then
+      printf '%s' "${ENV_RULE_LABELS[$i]}"
+      return
+    fi
+    i=$((i + 1))
+  done
+  printf 'PROD'
+}
+
 parse_elapsed() {
   local etime="$1"
   local days=0 hours=0 mins=0 secs=0
@@ -170,11 +238,12 @@ format_seconds() {
 
 fetch_agents() {
   AGENT_COUNT=0
-  A_STATE=(); A_WINPANE=(); A_UPTIME=(); A_WIN=(); A_TTY=(); A_STATE_SECS=()
+  A_STATE=(); A_WINPANE=(); A_UPTIME=(); A_WIN=(); A_TTY=(); A_CWD=(); A_STATE_SECS=()
+  BRANCH_CACHE_DIRS=(); BRANCH_CACHE_VALS=()
   C_SESSIONS=(); AGENT_PANE_IDS=(); AGENT_SESSIONS=()
   C_THINKING=0; C_WAITING=0; C_IDLE=0
   SESS_NAMES=(); SESS_START=(); SESS_COUNT=()
-  SESS_THINKING=(); SESS_WAITING=(); SESS_IDLE=()
+  SESS_THINKING=(); SESS_WAITING=(); SESS_IDLE=(); SESS_ENV=()
   APP_COUNT=0; APP_SESSION=(); APP_WIN=(); APP_CMD=()
 
   # Single ps call for both agents and apps
@@ -189,7 +258,7 @@ fetch_agents() {
 
   # Build TTY lookup via awk in one pass (avoids per-agent bash loops)
   local tmux_raw
-  tmux_raw=$(tmux list-panes -a -F '#{pane_tty}|#{session_name}|#{window_name}|#{pane_index}|#{pane_id}' 2>/dev/null || true)
+  tmux_raw=$(tmux list-panes -a -F '#{pane_tty}|#{session_name}|#{window_name}|#{pane_index}|#{pane_id}|#{pane_current_path}' 2>/dev/null || true)
 
   # Pre-build lookup arrays: TMUX_LOOKUP_* indexed by tty (via awk output)
   # Output format: tty|session|win:pane_idx|pane_id|win
@@ -215,12 +284,12 @@ fetch_agents() {
   # Join agents with tmux data via awk instead of per-agent lookup_tty calls
   local joined
   joined=$(awk -F'|' '
-    NR == FNR { sess[$1]=$2; wp[$1]=$3":"$4; pid5[$1]=$5; next }
+    NR == FNR { sess[$1]=$2; wp[$1]=$3":"$4; pid5[$1]=$5; cwd[$1]=$6; next }
     {
       split($0, f, " ")
       tty = f[1]; sub(/^\/dev\//, "", tty)
       if (tty in sess)
-        print sess[tty] "|" wp[tty] "|" f[2] "|" f[3] "|" f[4] "|" pid5[tty] "|" tty
+        print sess[tty] "|" wp[tty] "|" f[2] "|" f[3] "|" f[4] "|" pid5[tty] "|" tty "|" cwd[tty]
     }
   ' <(printf '%s\n' "$tmux_raw" | sed 's|^/dev/||') <(printf '%s\n' "$ps_agents") \
     | sort -t'|' -k1,1 -k2,2)
@@ -230,7 +299,7 @@ fetch_agents() {
   local now_epoch
   now_epoch=$(date +%s)
 
-  while IFS='|' read -r session winpane pid cpu etime pane_id tty; do
+  while IFS='|' read -r session winpane pid cpu etime pane_id tty agent_cwd; do
     [ -z "$session" ] && session="unknown"
     [ -z "$winpane" ] && winpane="?"
 
@@ -241,10 +310,20 @@ fetch_agents() {
     local agent_state
     agent_state=$(get_agent_state "$tty")
 
+    # CPU-based fallback: if state file says idle/unknown but process is
+    # burning CPU, the hook missed a transition — override to thinking
+    if [ "$agent_state" != "thinking" ] && [ "$agent_state" != "waiting" ]; then
+      local cpu_int="${cpu%.*}"
+      if [ "${cpu_int:-0}" -gt 15 ]; then
+        agent_state="thinking"
+      fi
+    fi
+
     A_STATE+=("$agent_state")
     A_WINPANE+=("$winpane")
     A_TTY+=("$tty")
     A_WIN+=("${winpane%%:*}")
+    A_CWD+=("$agent_cwd")
 
     # Time-in-current-state from state file mtime; fall back to process uptime
     local state_mtime secs_in_state=0
@@ -290,6 +369,25 @@ fetch_agents() {
     i=$((i + 1))
   done
 
+  # Determine per-session env tag from agent CWDs
+  local si=0
+  while [ "$si" -lt "${#SESS_NAMES[@]}" ]; do
+    local s_env="" s_ai="${SESS_START[$si]}"
+    local s_end=$((s_ai + SESS_COUNT[$si]))
+    while [ "$s_ai" -lt "$s_end" ]; do
+      local aenv
+      aenv=$(detect_env "${A_CWD[$s_ai]}")
+      if [ "$aenv" = "DEV" ]; then
+        s_env="DEV"; break
+      elif [ -n "$aenv" ] && [ -z "$s_env" ]; then
+        s_env="$aenv"
+      fi
+      s_ai=$((s_ai + 1))
+    done
+    SESS_ENV+=("$s_env")
+    si=$((si + 1))
+  done
+
   if [ "$SELECTED" -gt "$AGENT_COUNT" ]; then SELECTED=$AGENT_COUNT; fi
   if [ "$SELECTED" -lt 1 ] && [ "$AGENT_COUNT" -gt 0 ]; then SELECTED=1; fi
 
@@ -326,7 +424,7 @@ fetch_agents() {
 }
 
 build_render_items() {
-  RENDER_TYPE=(); RENDER_IDX=()
+  RENDER_TYPE=(); RENDER_IDX=(); RENDER_BRANCH=()
   RENDER_SESS_START=(); RENDER_SESS_COUNT=()
 
   local si=0
@@ -358,8 +456,20 @@ build_render_items() {
     while [ "$wwi" -lt "${#win_names[@]}" ]; do
       local wn="${win_names[$wwi]}"
 
+      # Detect branch from first agent's CWD in this window
+      local wbranch=""
+      ai="$s_start"
+      while [ "$ai" -lt "$s_end" ]; do
+        if [ "${A_WIN[$ai]}" = "$wn" ]; then
+          wbranch=$(detect_branch "${A_CWD[$ai]}")
+          break
+        fi
+        ai=$((ai + 1))
+      done
+
       RENDER_TYPE+=("h")
       RENDER_IDX+=("$wn")
+      RENDER_BRANCH+=("$wbranch")
       lines=$((lines + 1))
 
       ai="$s_start"
@@ -367,6 +477,7 @@ build_render_items() {
         if [ "${A_WIN[$ai]}" = "$wn" ]; then
           RENDER_TYPE+=("a")
           RENDER_IDX+=("$ai")
+          RENDER_BRANCH+=("")
           lines=$((lines + 1))
         fi
         ai=$((ai + 1))
@@ -377,6 +488,7 @@ build_render_items() {
         if [ "${APP_SESSION[$pi]}" = "$sname" ] && [ "${APP_WIN[$pi]}" = "$wn" ]; then
           RENDER_TYPE+=("p")
           RENDER_IDX+=("$pi")
+          RENDER_BRANCH+=("")
           lines=$((lines + 1))
         fi
         pi=$((pi + 1))
@@ -413,6 +525,7 @@ build_render_items() {
       local awname="${app_only_wins[$aowi]}"
       RENDER_TYPE+=("h")
       RENDER_IDX+=("$awname")
+      RENDER_BRANCH+=("")
       lines=$((lines + 1))
 
       pi=0
@@ -420,6 +533,7 @@ build_render_items() {
         if [ "${APP_SESSION[$pi]}" = "$sname" ] && [ "${APP_WIN[$pi]}" = "$awname" ]; then
           RENDER_TYPE+=("p")
           RENDER_IDX+=("$pi")
+          RENDER_BRANCH+=("")
           lines=$((lines + 1))
         fi
         pi=$((pi + 1))
@@ -710,15 +824,46 @@ print_agent_line() {
     "$color" "$up" "$X_RESET"
 }
 
-# Print window header: ▸ window-name
-# Args: window_name card_width
+# Print window header: ▸ window-name  branch  ENV
+# Args: window_name card_width branch env_tag
 print_window_header() {
-  local wname="$1" cw=$2
+  local wname="$1" cw=$2 branch="$3" env_tag="$4"
   local hdr="▸ ${wname}"
   local hdr_len=${#hdr}
-  local pad=$((cw - hdr_len))
+
+  # Reserve space for env tag on the right
+  local right_len=0
+  [ -n "$env_tag" ] && right_len=${#env_tag}
+
+  local show_branch=""
+  if [ -n "$branch" ]; then
+    local avail=$((cw - hdr_len - right_len - 2))
+    if [ "$avail" -gt 4 ]; then
+      if [ "${#branch}" -le "$avail" ]; then
+        show_branch="$branch"
+      else
+        show_branch="${branch:0:$((avail - 1))}…"
+      fi
+    fi
+  fi
+
+  local used=$hdr_len
+  [ -n "$show_branch" ] && used=$((used + 1 + ${#show_branch}))
+  local pad=$((cw - used - right_len))
   [ "$pad" -lt 0 ] && pad=0
-  printf '%s%s%s%s%*s' "$X_BOLD" "$X_CYAN" "$hdr" "$X_RESET" "$pad" ""
+
+  printf '%s%s%s%s' "$X_BOLD" "$X_CYAN" "$hdr" "$X_RESET"
+  if [ -n "$show_branch" ]; then
+    printf ' %s%s%s' "$X_DIM" "$show_branch" "$X_RESET"
+  fi
+  printf '%*s' "$pad" ""
+  if [ "$env_tag" = "DEV" ]; then
+    printf '%s%sDEV%s' "$X_GREEN" "$X_BOLD" "$X_RESET"
+  elif [ "$env_tag" = "PROD" ]; then
+    printf '%s%sPROD%s' "$X_RED" "$X_BOLD" "$X_RESET"
+  elif [ -n "$env_tag" ]; then
+    printf '%s%s%s%s' "$X_YELLOW" "$X_BOLD" "$env_tag" "$X_RESET"
+  fi
 }
 
 # Print app line:  ⚡ pnpm dev
@@ -767,21 +912,20 @@ render() {
 
   local total_sessions=${#SESS_NAMES[@]}
 
-  # Compute max columns that fit at MIN_COL_W
-  local max_cols=$(( (tw - 2) / MIN_COL_W ))
-  [ "$max_cols" -lt 1 ] && max_cols=1
-
-  # Render session columns in groups of max_cols
+  # Render session columns in groups of MAX_COLS
   local group=0
   while [ "$group" -lt "$total_sessions" ]; do
-    local remaining=$((total_sessions - group))
-    local ncols=$remaining
-    [ "$ncols" -gt "$max_cols" ] && ncols=$max_cols
+    local group_end=$((group + MAX_COLS))
+    [ "$group_end" -gt "$total_sessions" ] && group_end=$total_sessions
+    local ncols=$((group_end - group))
 
-    local group_end=$((group + ncols))
-
-    # Column width: divide terminal evenly across session columns
+    # Column width: divide terminal evenly, shrink if too narrow
     local cw=$(( (tw - 2) / ncols ))
+    while [ "$cw" -lt "$MIN_COL_W" ] && [ "$ncols" -gt 1 ]; do
+      ncols=$((ncols - 1))
+      cw=$(( (tw - 2) / ncols ))
+    done
+    group_end=$((group + ncols))
 
     # Find max render lines in this group of sessions
     local max_lines=0 c=$group
@@ -865,7 +1009,7 @@ render() {
 
           case "$rtype" in
             h)
-              print_window_header "$ridx" "$inner_w"
+              print_window_header "$ridx" "$inner_w" "${RENDER_BRANCH[$ri]}" "${SESS_ENV[$c]}"
               ;;
             a)
               local hl=0
