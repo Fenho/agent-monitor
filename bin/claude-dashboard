@@ -7,9 +7,24 @@
 REFRESH_INTERVAL=5
 STATE_DIR="/tmp/claude-agent-states"
 DATA_DIR="$HOME/.local/share/agent-monitor"
-TRACKER_FILE="$DATA_DIR/tracker.md"
-mkdir -p "$DATA_DIR"
-[ -f "$TRACKER_FILE" ] || printf '# Agent Tracker\n\n' > "$TRACKER_FILE"
+TRACKER_DIR="$DATA_DIR/tracker"
+NOTES_FILE="$DATA_DIR/notes.md"
+HISTORY_FILE="$DATA_DIR/shipped.md"
+TRACKER_STAGES=("BACKLOG.md" "TODO.md" "IN_PROGRESS.md" "DONE.md")
+mkdir -p "$DATA_DIR" "$TRACKER_DIR"
+for _tf in "${TRACKER_STAGES[@]}"; do
+  [ -f "$TRACKER_DIR/$_tf" ] || printf '# %s\n\n' "${_tf%.md}" > "$TRACKER_DIR/$_tf"
+done
+# One-time migration: old tracker.md → notes.md
+[ -f "$DATA_DIR/tracker.md" ] && [ ! -f "$NOTES_FILE" ] && mv "$DATA_DIR/tracker.md" "$NOTES_FILE"
+[ -f "$NOTES_FILE" ] || printf '# Notes\n\n' > "$NOTES_FILE"
+# One-time migration: old flags → lanes (flagged agents → MY REVIEW lane)
+if [ -f "/tmp/claude-dashboard-flags" ] && [ ! -f "/tmp/claude-dashboard-lanes" ]; then
+  while IFS= read -r _ftty; do
+    [ -n "$_ftty" ] && printf '%s|1\n' "$_ftty"
+  done < "/tmp/claude-dashboard-flags" > "/tmp/claude-dashboard-lanes"
+  rm -f "/tmp/claude-dashboard-flags"
+fi
 MAX_COLS=8
 MIN_COL_W=14
 
@@ -20,6 +35,7 @@ RESET='\033[0m'
 GREEN='\033[32m'
 YELLOW='\033[33m'
 CYAN='\033[36m'
+RED='\033[31m'
 WHITE='\033[37m'
 BG_BLUE='\033[44m'
 EL='\033[K'
@@ -37,8 +53,16 @@ X_CYAN=$(printf '\033[36m')
 X_ORANGE=$(printf '\033[38;5;208m')
 X_RED=$(printf '\033[31m')
 X_MAGENTA=$(printf '\033[35m')
-X_BG_MARK=$(printf '\033[48;5;53m')
-X_BG_MARK_DIM=$(printf '\033[48;5;54m')
+# Link colors — FG/BG pairs for linked agent pairs (up to 6 links)
+X_LINK_FG=()
+X_LINK_BG=()
+X_LINK_FG[0]=$(printf '\033[38;5;213m');  X_LINK_BG[0]=$(printf '\033[48;5;53m')   # pink
+X_LINK_FG[1]=$(printf '\033[38;5;117m');  X_LINK_BG[1]=$(printf '\033[48;5;24m')   # blue
+X_LINK_FG[2]=$(printf '\033[38;5;156m');  X_LINK_BG[2]=$(printf '\033[48;5;22m')   # green
+X_LINK_FG[3]=$(printf '\033[38;5;222m');  X_LINK_BG[3]=$(printf '\033[48;5;58m')   # gold
+X_LINK_FG[4]=$(printf '\033[38;5;183m');  X_LINK_BG[4]=$(printf '\033[48;5;54m')   # lavender
+X_LINK_FG[5]=$(printf '\033[38;5;209m');  X_LINK_BG[5]=$(printf '\033[48;5;130m')  # salmon
+LINK_COLOR_COUNT=6
 
 SPINNER=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
 SPIN_IDX=0
@@ -69,18 +93,39 @@ PREV_A_TTY=()
 PREV_A_STATE=()
 PREV_A_MTIME=()
 
+# Agent linking
+LINK_PENDING=0
+LINK_PENDING_TTY=""
+LINK_TTY_A=()
+LINK_TTY_B=()
+LINK_COLOR_IDX=()
+MSG_DIR="/tmp/claude-agent-messages"
+
 # Per-app
 APP_COUNT=0
 APP_SESSION=()
 APP_WIN=()
 APP_CMD=()
 
+# Visual order: agent indices sorted by lane then session
+VIS_AGENTS=()
+VIS_COUNT=0
+A_LANE=()
+
+# Per-lane render metadata (flat arrays with lane offsets)
+LANE_R_SESS_OFF=()     # offset into LANE_R_SESS_NAMES for each lane
+LANE_R_NSESS=()        # session count per lane
+LANE_R_SESS_NAMES=()   # flat: session names
+LANE_R_SESS_ORIG=()    # flat: original SESS_NAMES index
+LANE_R_RENDER_OFF=()   # flat: offset into RENDER_TYPE/IDX
+LANE_R_RENDER_CNT=()   # flat: render line count
+VIS_LSESS_START=()     # flat: VIS_AGENTS offset per lane-session
+VIS_LSESS_COUNT=()     # flat: agent count per lane-session
+
 # Render items (flat sequence, per-session offsets)
 RENDER_TYPE=()         # "h"=window header, "a"=agent, "p"=app
 RENDER_IDX=()          # agent/app index (for "a"/"p"), window name (for "h")
 RENDER_BRANCH=()       # git branch for "h" items, empty for others
-RENDER_SESS_START=()   # offset into RENDER_* for each session
-RENDER_SESS_COUNT=()   # line count per session
 
 # Session boundaries (populated by fetch_agents)
 SESS_NAMES=()    # unique session names
@@ -95,6 +140,54 @@ SESS_ENV=()
 STATE_TTYS=()
 STATE_VALS=()
 STATE_MTIMES=()
+
+prune_stale_states() {
+  local ps_agents="$1"
+  [ -d "$STATE_DIR" ] || return
+  # Build set of live agent TTYs from ps output
+  local live_ttys
+  live_ttys=$(printf '%s\n' "$ps_agents" | awk '{gsub(/^\/dev\//, "", $1); print $1}')
+
+  # Collect all state files: tty, mtime, path
+  local sf_ttys=() sf_mtimes=() sf_paths=()
+  for sf in "$STATE_DIR"/*; do
+    [ -f "$sf" ] || continue
+    local s_state="" s_tty=""
+    { read -r s_state; read -r s_tty; } < "$sf"
+    if [ -z "$s_tty" ]; then
+      rm -f "$sf"; continue
+    fi
+    # Remove files for dead processes
+    if ! printf '%s\n' "$live_ttys" | grep -qxF "$s_tty"; then
+      rm -f "$sf"; continue
+    fi
+    local s_mt
+    s_mt=$(stat -f %m "$sf" 2>/dev/null) || s_mt=0
+    sf_ttys+=("$s_tty")
+    sf_mtimes+=("$s_mt")
+    sf_paths+=("$sf")
+  done
+
+  # For duplicate TTYs, keep only the newest state file
+  local i=0
+  while [ "$i" -lt "${#sf_ttys[@]}" ]; do
+    local j=$((i + 1))
+    while [ "$j" -lt "${#sf_ttys[@]}" ]; do
+      if [ "${sf_ttys[$i]}" = "${sf_ttys[$j]}" ]; then
+        if [ "${sf_mtimes[$i]}" -ge "${sf_mtimes[$j]}" ]; then
+          rm -f "${sf_paths[$j]}"
+          sf_ttys[$j]=""; sf_paths[$j]=""
+        else
+          rm -f "${sf_paths[$i]}"
+          sf_ttys[$i]=""; sf_paths[$i]=""
+          break
+        fi
+      fi
+      j=$((j + 1))
+    done
+    i=$((i + 1))
+  done
+}
 
 load_agent_states() {
   STATE_TTYS=()
@@ -243,7 +336,7 @@ fetch_agents() {
   C_SESSIONS=(); AGENT_PANE_IDS=(); AGENT_SESSIONS=()
   C_THINKING=0; C_WAITING=0; C_IDLE=0
   SESS_NAMES=(); SESS_START=(); SESS_COUNT=()
-  SESS_THINKING=(); SESS_WAITING=(); SESS_IDLE=(); SESS_ENV=()
+  SESS_THINKING=(); SESS_WAITING=(); SESS_IDLE=(); SESS_ENV=(); SESS_ACTIVE=()
   APP_COUNT=0; APP_SESSION=(); APP_WIN=(); APP_CMD=()
 
   # Single ps call for both agents and apps
@@ -254,7 +347,7 @@ fetch_agents() {
   [ -z "$ps_agents" ] && return
 
   local ps_apps
-  ps_apps=$(ps -eo tty=,args= 2>/dev/null | grep 'pnpm' | grep ' dev' | grep -v grep || true)
+  ps_apps=$(ps -eo tty=,args= 2>/dev/null | grep '[p]npm ' || true)
 
   # Build TTY lookup via awk in one pass (avoids per-agent bash loops)
   local tmux_raw
@@ -280,6 +373,9 @@ fetch_agents() {
   local tmux_count=${#TMUX_L_TTY[@]}
 
   load_agent_states
+
+  # Prune state files for agents that no longer exist
+  prune_stale_states "$ps_agents"
 
   # Join agents with tmux data via awk instead of per-agent lookup_tty calls
   local joined
@@ -310,6 +406,17 @@ fetch_agents() {
     local agent_state
     agent_state=$(get_agent_state "$tty")
 
+    # Stale "thinking" override: PostToolUse fires frequently during active
+    # work, so if the state file hasn't been updated in >3 min the agent
+    # likely finished but the Stop hook didn't fire.
+    if [ "$agent_state" = "thinking" ]; then
+      local st_mtime
+      st_mtime=$(get_state_mtime "$tty")
+      if [ "$st_mtime" -gt 0 ] && [ $((now_epoch - st_mtime)) -gt 180 ]; then
+        agent_state="idle"
+      fi
+    fi
+
     # CPU-based fallback: if state file says idle/unknown but process is
     # burning CPU, the hook missed a transition — override to thinking
     if [ "$agent_state" != "thinking" ] && [ "$agent_state" != "waiting" ]; then
@@ -339,7 +446,9 @@ fetch_agents() {
 
     case "$agent_state" in
       thinking) C_THINKING=$((C_THINKING + 1)) ;;
-      waiting)  C_WAITING=$((C_WAITING + 1)) ;;
+      waiting)
+        C_WAITING=$((C_WAITING + 1))
+        ;;
       *)        C_IDLE=$((C_IDLE + 1)) ;;
     esac
 
@@ -347,6 +456,7 @@ fetch_agents() {
   done <<< "$joined"
 
   # Build session boundary lookup
+  C_ACTIVE_SESSIONS=0
   local prev="" i=0
   while [ "$i" -lt "$AGENT_COUNT" ]; do
     local s="${C_SESSIONS[$i]}"
@@ -357,13 +467,20 @@ fetch_agents() {
       SESS_THINKING+=(0)
       SESS_WAITING+=(0)
       SESS_IDLE+=(0)
+      SESS_ACTIVE+=(0)
       prev="$s"
     fi
     local si=$(( ${#SESS_COUNT[@]} - 1 ))
     SESS_COUNT[$si]=$(( ${SESS_COUNT[$si]} + 1 ))
     case "${A_STATE[$i]}" in
-      thinking) SESS_THINKING[$si]=$(( ${SESS_THINKING[$si]} + 1 )) ;;
-      waiting)  SESS_WAITING[$si]=$(( ${SESS_WAITING[$si]} + 1 )) ;;
+      thinking)
+        SESS_THINKING[$si]=$(( ${SESS_THINKING[$si]} + 1 ))
+        SESS_ACTIVE[$si]=1
+        ;;
+      waiting)
+        SESS_WAITING[$si]=$(( ${SESS_WAITING[$si]} + 1 ))
+        [ "${A_STATE_SECS[$i]}" -lt 300 ] && SESS_ACTIVE[$si]=1
+        ;;
       *)        SESS_IDLE[$si]=$(( ${SESS_IDLE[$si]} + 1 )) ;;
     esac
     i=$((i + 1))
@@ -388,24 +505,28 @@ fetch_agents() {
     si=$((si + 1))
   done
 
-  if [ "$SELECTED" -gt "$AGENT_COUNT" ]; then SELECTED=$AGENT_COUNT; fi
-  if [ "$SELECTED" -lt 1 ] && [ "$AGENT_COUNT" -gt 0 ]; then SELECTED=1; fi
+  # SELECTED is clamped to VIS_COUNT after build_render_items
 
-  # Detect apps (pnpm dev) — only in sessions that have agents
+  # Detect apps (any pnpm process) — only in sessions that have agents
   if [ -n "$ps_apps" ]; then
-    # Join apps with tmux data via awk
+    # Join apps with tmux data via awk, extracting the pnpm subcommand
     local app_joined
     app_joined=$(awk -F'|' '
       NR == FNR { sess[$1]=$2; win[$1]=$3; next }
       {
         split($0, f, " ")
         tty = f[1]; sub(/^\/dev\//, "", tty)
-        if (tty in sess && !seen[tty]++) print sess[tty] "|" win[tty]
+        # extract the pnpm subcommand (dev, fenhogod, etc.)
+        cmd = "dev"
+        for (i = 2; i <= length(f); i++) {
+          if ((f[i] == "pnpm" || f[i] ~ /\/pnpm$/) && i < length(f)) { cmd = f[i+1]; break }
+        }
+        if (tty in sess && !seen[tty]++) print sess[tty] "|" win[tty] "|pnpm " cmd
       }
     ' <(printf '%s\n' "$tmux_raw" | sed 's|^/dev/||' | awk -F'|' '{print $1 "|" $2 "|" $3}') \
       <(printf '%s\n' "$ps_apps"))
 
-    while IFS='|' read -r asess awin; do
+    while IFS='|' read -r asess awin acmd; do
       [ -z "$asess" ] && continue
       # Only include apps in sessions that have agents
       local found=0 asi=0
@@ -417,7 +538,7 @@ fetch_agents() {
 
       APP_SESSION+=("$asess")
       APP_WIN+=("${awin:-?}")
-      APP_CMD+=("pnpm dev")
+      APP_CMD+=("${acmd:-pnpm dev}")
       APP_COUNT=$((APP_COUNT + 1))
     done <<< "$app_joined"
   fi
@@ -425,126 +546,161 @@ fetch_agents() {
 
 build_render_items() {
   RENDER_TYPE=(); RENDER_IDX=(); RENDER_BRANCH=()
-  RENDER_SESS_START=(); RENDER_SESS_COUNT=()
+  VIS_AGENTS=(); VIS_COUNT=0; A_LANE=()
+  LANE_R_SESS_OFF=(); LANE_R_NSESS=()
+  LANE_R_SESS_NAMES=(); LANE_R_SESS_ORIG=()
+  LANE_R_RENDER_OFF=(); LANE_R_RENDER_CNT=()
+  VIS_LSESS_START=(); VIS_LSESS_COUNT=()
 
-  local si=0
-  while [ "$si" -lt "${#SESS_NAMES[@]}" ]; do
-    local sname="${SESS_NAMES[$si]}"
-    local s_start="${SESS_START[$si]}"
-    local s_count="${SESS_COUNT[$si]}"
-    local s_end=$((s_start + s_count))
+  # Cache lane assignments and count per-lane agents (skip shipped)
+  C_LANE_COUNTS=(0 0 0)
+  local i=0
+  while [ "$i" -lt "$AGENT_COUNT" ]; do
+    local _al
+    _al=$(get_lane "${A_TTY[$i]}")
+    A_LANE+=("$_al")
+    if ! has_shipped "${A_TTY[$i]}"; then
+      C_LANE_COUNTS[$_al]=$(( ${C_LANE_COUNTS[$_al]} + 1 ))
+    fi
+    i=$((i + 1))
+  done
 
-    RENDER_SESS_START+=("${#RENDER_TYPE[@]}")
-    local lines=0
+  local lane=0
+  while [ "$lane" -lt "$LANE_COUNT" ]; do
+    LANE_R_SESS_OFF+=("${#LANE_R_SESS_NAMES[@]}")
+    local nsess=0
 
-    # Collect unique window names for agents in this session (preserving order)
-    local win_names=()
-    local ai="$s_start"
-    while [ "$ai" -lt "$s_end" ]; do
-      local wn="${A_WIN[$ai]}"
-      local dup=0 dwi=0
-      while [ "$dwi" -lt "${#win_names[@]}" ]; do
-        [ "${win_names[$dwi]}" = "$wn" ] && { dup=1; break; }
-        dwi=$((dwi + 1))
-      done
-      [ "$dup" -eq 0 ] && win_names+=("$wn")
-      ai=$((ai + 1))
-    done
+    local si=0
+    while [ "$si" -lt "${#SESS_NAMES[@]}" ]; do
+      local sname="${SESS_NAMES[$si]}"
+      local s_start="${SESS_START[$si]}"
+      local s_count="${SESS_COUNT[$si]}"
+      local s_end=$((s_start + s_count))
 
-    # For each agent window: header + agents + matching apps
-    local wwi=0
-    while [ "$wwi" -lt "${#win_names[@]}" ]; do
-      local wn="${win_names[$wwi]}"
-
-      # Detect branch from first agent's CWD in this window
-      local wbranch=""
-      ai="$s_start"
+      # Collect agents in this session+lane (skip shipped)
+      local lane_agents=()
+      local ai="$s_start"
       while [ "$ai" -lt "$s_end" ]; do
-        if [ "${A_WIN[$ai]}" = "$wn" ]; then
-          wbranch=$(detect_branch "${A_CWD[$ai]}")
-          break
+        if [ "${A_LANE[$ai]}" -eq "$lane" ] && ! has_shipped "${A_TTY[$ai]}"; then
+          lane_agents+=("$ai")
         fi
         ai=$((ai + 1))
       done
 
-      RENDER_TYPE+=("h")
-      RENDER_IDX+=("$wn")
-      RENDER_BRANCH+=("$wbranch")
-      lines=$((lines + 1))
+      [ "${#lane_agents[@]}" -eq 0 ] && { si=$((si + 1)); continue; }
 
-      ai="$s_start"
-      while [ "$ai" -lt "$s_end" ]; do
-        if [ "${A_WIN[$ai]}" = "$wn" ]; then
-          RENDER_TYPE+=("a")
-          RENDER_IDX+=("$ai")
-          RENDER_BRANCH+=("")
-          lines=$((lines + 1))
-        fi
-        ai=$((ai + 1))
+      LANE_R_SESS_NAMES+=("$sname")
+      LANE_R_SESS_ORIG+=("$si")
+      LANE_R_RENDER_OFF+=("${#RENDER_TYPE[@]}")
+      VIS_LSESS_START+=("$VIS_COUNT")
+      VIS_LSESS_COUNT+=("${#lane_agents[@]}")
+      local lines=0
+      nsess=$((nsess + 1))
+
+      # Add to visual order
+      local lai=0
+      while [ "$lai" -lt "${#lane_agents[@]}" ]; do
+        VIS_AGENTS+=("${lane_agents[$lai]}")
+        VIS_COUNT=$((VIS_COUNT + 1))
+        lai=$((lai + 1))
       done
 
+      # Collect unique windows for these agents
+      local win_names=()
+      lai=0
+      while [ "$lai" -lt "${#lane_agents[@]}" ]; do
+        local wn="${A_WIN[${lane_agents[$lai]}]}"
+        local dup=0 dwi=0
+        while [ "$dwi" -lt "${#win_names[@]}" ]; do
+          [ "${win_names[$dwi]}" = "$wn" ] && { dup=1; break; }
+          dwi=$((dwi + 1))
+        done
+        [ "$dup" -eq 0 ] && win_names+=("$wn")
+        lai=$((lai + 1))
+      done
+
+      # Build render items: window headers + agents + apps
+      local wwi=0
+      while [ "$wwi" -lt "${#win_names[@]}" ]; do
+        local wn="${win_names[$wwi]}"
+        # Detect branch from first agent in this window
+        local wbranch="" _lai=0
+        while [ "$_lai" -lt "${#lane_agents[@]}" ]; do
+          if [ "${A_WIN[${lane_agents[$_lai]}]}" = "$wn" ]; then
+            wbranch=$(detect_branch "${A_CWD[${lane_agents[$_lai]}]}")
+            break
+          fi
+          _lai=$((_lai + 1))
+        done
+        RENDER_TYPE+=("h"); RENDER_IDX+=("$wn"); RENDER_BRANCH+=("$wbranch"); lines=$((lines + 1))
+
+        lai=0
+        while [ "$lai" -lt "${#lane_agents[@]}" ]; do
+          if [ "${A_WIN[${lane_agents[$lai]}]}" = "$wn" ]; then
+            RENDER_TYPE+=("a"); RENDER_IDX+=("${lane_agents[$lai]}"); RENDER_BRANCH+=(""); lines=$((lines + 1))
+          fi
+          lai=$((lai + 1))
+        done
+
+        # Apps in this window
+        local pi=0
+        while [ "$pi" -lt "$APP_COUNT" ]; do
+          if [ "${APP_SESSION[$pi]}" = "$sname" ] && [ "${APP_WIN[$pi]}" = "$wn" ]; then
+            RENDER_TYPE+=("p"); RENDER_IDX+=("$pi"); RENDER_BRANCH+=(""); lines=$((lines + 1))
+          fi
+          pi=$((pi + 1))
+        done
+        wwi=$((wwi + 1))
+      done
+
+      # App-only windows in this session
+      local app_only_wins=()
       local pi=0
       while [ "$pi" -lt "$APP_COUNT" ]; do
-        if [ "${APP_SESSION[$pi]}" = "$sname" ] && [ "${APP_WIN[$pi]}" = "$wn" ]; then
-          RENDER_TYPE+=("p")
-          RENDER_IDX+=("$pi")
-          RENDER_BRANCH+=("")
-          lines=$((lines + 1))
-        fi
-        pi=$((pi + 1))
-      done
-
-      wwi=$((wwi + 1))
-    done
-
-    # Second pass: app-only windows in this session
-    local app_only_wins=()
-    local pi=0
-    while [ "$pi" -lt "$APP_COUNT" ]; do
-      if [ "${APP_SESSION[$pi]}" = "$sname" ]; then
-        local awname="${APP_WIN[$pi]}"
-        local has_agents=0 awi=0
-        while [ "$awi" -lt "${#win_names[@]}" ]; do
-          [ "${win_names[$awi]}" = "$awname" ] && { has_agents=1; break; }
-          awi=$((awi + 1))
-        done
-        if [ "$has_agents" -eq 0 ]; then
-          local adup=0 aoi=0
-          while [ "$aoi" -lt "${#app_only_wins[@]}" ]; do
-            [ "${app_only_wins[$aoi]}" = "$awname" ] && { adup=1; break; }
-            aoi=$((aoi + 1))
+        if [ "${APP_SESSION[$pi]}" = "$sname" ]; then
+          local awname="${APP_WIN[$pi]}"
+          local has_aw=0 awi=0
+          while [ "$awi" -lt "${#win_names[@]}" ]; do
+            [ "${win_names[$awi]}" = "$awname" ] && { has_aw=1; break; }
+            awi=$((awi + 1))
           done
-          [ "$adup" -eq 0 ] && app_only_wins+=("$awname")
-        fi
-      fi
-      pi=$((pi + 1))
-    done
-
-    local aowi=0
-    while [ "$aowi" -lt "${#app_only_wins[@]}" ]; do
-      local awname="${app_only_wins[$aowi]}"
-      RENDER_TYPE+=("h")
-      RENDER_IDX+=("$awname")
-      RENDER_BRANCH+=("")
-      lines=$((lines + 1))
-
-      pi=0
-      while [ "$pi" -lt "$APP_COUNT" ]; do
-        if [ "${APP_SESSION[$pi]}" = "$sname" ] && [ "${APP_WIN[$pi]}" = "$awname" ]; then
-          RENDER_TYPE+=("p")
-          RENDER_IDX+=("$pi")
-          RENDER_BRANCH+=("")
-          lines=$((lines + 1))
+          if [ "$has_aw" -eq 0 ]; then
+            local adup=0 aoi=0
+            while [ "$aoi" -lt "${#app_only_wins[@]}" ]; do
+              [ "${app_only_wins[$aoi]}" = "$awname" ] && { adup=1; break; }
+              aoi=$((aoi + 1))
+            done
+            [ "$adup" -eq 0 ] && app_only_wins+=("$awname")
+          fi
         fi
         pi=$((pi + 1))
       done
 
-      aowi=$((aowi + 1))
+      local aowi=0
+      while [ "$aowi" -lt "${#app_only_wins[@]}" ]; do
+        local awname="${app_only_wins[$aowi]}"
+        RENDER_TYPE+=("h"); RENDER_IDX+=("$awname"); RENDER_BRANCH+=(""); lines=$((lines + 1))
+        pi=0
+        while [ "$pi" -lt "$APP_COUNT" ]; do
+          if [ "${APP_SESSION[$pi]}" = "$sname" ] && [ "${APP_WIN[$pi]}" = "$awname" ]; then
+            RENDER_TYPE+=("p"); RENDER_IDX+=("$pi"); RENDER_BRANCH+=(""); lines=$((lines + 1))
+          fi
+          pi=$((pi + 1))
+        done
+        aowi=$((aowi + 1))
+      done
+
+      LANE_R_RENDER_CNT+=("$lines")
+      si=$((si + 1))
     done
 
-    RENDER_SESS_COUNT+=("$lines")
-    si=$((si + 1))
+    LANE_R_NSESS+=("$nsess")
+    lane=$((lane + 1))
   done
+
+  # Clamp selection to visual order bounds
+  if [ "$SELECTED" -gt "$VIS_COUNT" ]; then SELECTED=$VIS_COUNT; fi
+  if [ "$SELECTED" -lt 1 ] && [ "$VIS_COUNT" -gt 0 ]; then SELECTED=1; fi
 }
 
 PREV_STATE_FILE="/tmp/claude-dashboard-prev-states"
@@ -555,6 +711,21 @@ NOTIF_TTYS=()
 
 MARK_FILE="/tmp/claude-dashboard-marks"
 MARK_TTYS=()
+
+LANE_FILE="/tmp/claude-dashboard-lanes"
+LANE_TTYS=()
+LANE_VALS=()
+LANE_COUNT=3
+LANE_LABELS=("WORKING" "MY REVIEW" "PR REVIEW")
+X_LANE_WORKING=$(printf '\033[38;5;39m')   # bright blue
+X_LANE_REVIEW=$(printf '\033[38;5;141m')   # lavender
+X_LANE_PR=$(printf '\033[38;5;213m')       # pink
+LANE_COLORS=("$X_LANE_WORKING" "$X_LANE_REVIEW" "$X_LANE_PR")
+
+SHIPPED_FILE="/tmp/claude-dashboard-shipped"
+SHIPPED_TTYS=()
+
+LINK_FILE="/tmp/claude-dashboard-links"
 
 load_notifications() {
   NOTIF_TTYS=()
@@ -642,6 +813,454 @@ toggle_mark() {
   save_marks
 }
 
+load_lanes() {
+  LANE_TTYS=()
+  LANE_VALS=()
+  [ -f "$LANE_FILE" ] || return
+  while IFS='|' read -r ltty lval; do
+    [ -n "$ltty" ] || continue
+    LANE_TTYS+=("$ltty")
+    LANE_VALS+=("$lval")
+  done < "$LANE_FILE"
+}
+
+save_lanes() {
+  : > "$LANE_FILE"
+  local i=0
+  while [ "$i" -lt "${#LANE_TTYS[@]}" ]; do
+    printf '%s|%s\n' "${LANE_TTYS[$i]}" "${LANE_VALS[$i]}" >> "$LANE_FILE"
+    i=$((i + 1))
+  done
+}
+
+get_lane() {
+  local tty="$1" i=0
+  while [ "$i" -lt "${#LANE_TTYS[@]}" ]; do
+    if [ "${LANE_TTYS[$i]}" = "$tty" ]; then
+      printf '%d' "${LANE_VALS[$i]}"
+      return
+    fi
+    i=$((i + 1))
+  done
+  printf '0'
+}
+
+set_lane() {
+  local tty="$1" lane="$2" i=0
+  while [ "$i" -lt "${#LANE_TTYS[@]}" ]; do
+    if [ "${LANE_TTYS[$i]}" = "$tty" ]; then
+      LANE_VALS[$i]="$lane"
+      save_lanes
+      return
+    fi
+    i=$((i + 1))
+  done
+  LANE_TTYS+=("$tty")
+  LANE_VALS+=("$lane")
+  save_lanes
+}
+
+advance_lane() {
+  local tty="$1"
+  local cur
+  cur=$(get_lane "$tty")
+  local next=$((cur + 1))
+  [ "$next" -ge "$LANE_COUNT" ] && next=0
+  set_lane "$tty" "$next"
+}
+
+retreat_lane() {
+  local tty="$1"
+  local cur
+  cur=$(get_lane "$tty")
+  local prev=$((cur - 1))
+  [ "$prev" -lt 0 ] && prev=$((LANE_COUNT - 1))
+  set_lane "$tty" "$prev"
+}
+
+load_shipped() {
+  SHIPPED_TTYS=()
+  [ -f "$SHIPPED_FILE" ] || return
+  while IFS= read -r stty; do
+    [ -n "$stty" ] && SHIPPED_TTYS+=("$stty")
+  done < "$SHIPPED_FILE"
+}
+
+save_shipped() {
+  : > "$SHIPPED_FILE"
+  local i=0
+  while [ "$i" -lt "${#SHIPPED_TTYS[@]}" ]; do
+    printf '%s\n' "${SHIPPED_TTYS[$i]}" >> "$SHIPPED_FILE"
+    i=$((i + 1))
+  done
+}
+
+has_shipped() {
+  local tty="$1" i=0
+  while [ "$i" -lt "${#SHIPPED_TTYS[@]}" ]; do
+    [ "${SHIPPED_TTYS[$i]}" = "$tty" ] && return 0
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# Drop entries whose TTYs are no longer live
+prune_shipped() {
+  local new_list=() changed=0 i=0
+  while [ "$i" -lt "${#SHIPPED_TTYS[@]}" ]; do
+    local stty="${SHIPPED_TTYS[$i]}" live=0 j=0
+    while [ "$j" -lt "$AGENT_COUNT" ]; do
+      [ "${A_TTY[$j]}" = "$stty" ] && { live=1; break; }
+      j=$((j + 1))
+    done
+    if [ "$live" -eq 1 ]; then
+      new_list+=("$stty")
+    else
+      changed=1
+    fi
+    i=$((i + 1))
+  done
+  if [ "$changed" -eq 1 ]; then
+    SHIPPED_TTYS=("${new_list[@]}")
+    save_shipped
+  fi
+}
+
+# Drop lane entries whose TTYs are no longer live (so reused TTYs default to WORKING)
+prune_lanes() {
+  local new_ttys=() new_vals=() changed=0 i=0
+  while [ "$i" -lt "${#LANE_TTYS[@]}" ]; do
+    local ltty="${LANE_TTYS[$i]}" live=0 j=0
+    while [ "$j" -lt "$AGENT_COUNT" ]; do
+      [ "${A_TTY[$j]}" = "$ltty" ] && { live=1; break; }
+      j=$((j + 1))
+    done
+    if [ "$live" -eq 1 ]; then
+      new_ttys+=("$ltty")
+      new_vals+=("${LANE_VALS[$i]}")
+    else
+      changed=1
+    fi
+    i=$((i + 1))
+  done
+  if [ "$changed" -eq 1 ]; then
+    LANE_TTYS=("${new_ttys[@]}")
+    LANE_VALS=("${new_vals[@]}")
+    save_lanes
+  fi
+}
+
+# Append quest to history file, mark all session agents as shipped
+ship_quest() {
+  [ "$VIS_COUNT" -eq 0 ] && return
+  local aidx=${VIS_AGENTS[$((SELECTED - 1))]}
+  local session="${AGENT_SESSIONS[$aidx]}"
+
+  # Collect distinct task titles from agents in this session
+  local tasks="" i=0
+  while [ "$i" -lt "$AGENT_COUNT" ]; do
+    if [ "${AGENT_SESSIONS[$i]}" = "$session" ]; then
+      local t
+      t=$(task_for_agent "${AGENT_PANE_IDS[$i]}")
+      if [ -n "$t" ]; then
+        case "; $tasks ;" in
+          *"; $t ;"*) ;;
+          *)
+            if [ -z "$tasks" ]; then tasks="$t"; else tasks="${tasks}; $t"; fi
+            ;;
+        esac
+      fi
+    fi
+    i=$((i + 1))
+  done
+
+  local today now_time
+  today=$(date +%Y-%m-%d)
+  now_time=$(date +%H:%M)
+  [ -f "$HISTORY_FILE" ] || printf '# Shipped\n\n' > "$HISTORY_FILE"
+  if ! grep -q "^## ${today}$" "$HISTORY_FILE" 2>/dev/null; then
+    printf '\n## %s\n\n' "$today" >> "$HISTORY_FILE"
+  fi
+  local entry="- **${now_time}** ${session}"
+  [ -n "$tasks" ] && entry="${entry} — ${tasks}"
+  printf '%s\n' "$entry" >> "$HISTORY_FILE"
+
+  # Mark all session agents shipped
+  i=0
+  while [ "$i" -lt "$AGENT_COUNT" ]; do
+    if [ "${AGENT_SESSIONS[$i]}" = "$session" ]; then
+      SHIPPED_TTYS+=("${A_TTY[$i]}")
+    fi
+    i=$((i + 1))
+  done
+  save_shipped
+  build_render_items
+}
+
+# Set target lane for every agent in the given session (one save)
+set_quest_lane() {
+  local session="$1" target="$2"
+  local i=0
+  while [ "$i" -lt "$AGENT_COUNT" ]; do
+    if [ "${AGENT_SESSIONS[$i]}" = "$session" ]; then
+      local tty="${A_TTY[$i]}"
+      local found=0 j=0
+      while [ "$j" -lt "${#LANE_TTYS[@]}" ]; do
+        if [ "${LANE_TTYS[$j]}" = "$tty" ]; then
+          LANE_VALS[$j]="$target"
+          found=1; break
+        fi
+        j=$((j + 1))
+      done
+      if [ "$found" -eq 0 ]; then
+        LANE_TTYS+=("$tty")
+        LANE_VALS+=("$target")
+      fi
+    fi
+    i=$((i + 1))
+  done
+  save_lanes
+}
+
+# Move entire quest forward: WORKING→MY REVIEW→PR REVIEW→ship
+advance_quest() {
+  [ "$VIS_COUNT" -eq 0 ] && return
+  local aidx=${VIS_AGENTS[$((SELECTED - 1))]}
+  local saved_tty="${A_TTY[$aidx]}"
+  local cur_lane=${A_LANE[$aidx]}
+  if [ "$cur_lane" -ge $((LANE_COUNT - 1)) ]; then
+    ship_quest
+    # Try to keep selection near where it was
+    local vi=0
+    while [ "$vi" -lt "$VIS_COUNT" ]; do
+      if [ "${A_TTY[${VIS_AGENTS[$vi]}]}" = "$saved_tty" ]; then
+        SELECTED=$((vi + 1)); return
+      fi
+      vi=$((vi + 1))
+    done
+    [ "$VIS_COUNT" -gt 0 ] && [ "$SELECTED" -gt "$VIS_COUNT" ] && SELECTED=$VIS_COUNT
+    return
+  fi
+  local target=$((cur_lane + 1))
+  set_quest_lane "${AGENT_SESSIONS[$aidx]}" "$target"
+  build_render_items
+  local vi=0
+  while [ "$vi" -lt "$VIS_COUNT" ]; do
+    if [ "${A_TTY[${VIS_AGENTS[$vi]}]}" = "$saved_tty" ]; then
+      SELECTED=$((vi + 1)); return
+    fi
+    vi=$((vi + 1))
+  done
+}
+
+# Move entire quest backward: PR REVIEW→MY REVIEW→WORKING, stops at WORKING
+retreat_quest() {
+  [ "$VIS_COUNT" -eq 0 ] && return
+  local aidx=${VIS_AGENTS[$((SELECTED - 1))]}
+  local saved_tty="${A_TTY[$aidx]}"
+  local cur_lane=${A_LANE[$aidx]}
+  [ "$cur_lane" -le 0 ] && return
+  local target=$((cur_lane - 1))
+  set_quest_lane "${AGENT_SESSIONS[$aidx]}" "$target"
+  build_render_items
+  local vi=0
+  while [ "$vi" -lt "$VIS_COUNT" ]; do
+    if [ "${A_TTY[${VIS_AGENTS[$vi]}]}" = "$saved_tty" ]; then
+      SELECTED=$((vi + 1)); return
+    fi
+    vi=$((vi + 1))
+  done
+}
+
+# ── Link management ──────────────────────────────────────────────────
+
+load_links() {
+  LINK_TTY_A=(); LINK_TTY_B=(); LINK_COLOR_IDX=()
+  [ -f "$LINK_FILE" ] || return
+  while IFS='|' read -r la lb lc; do
+    [ -n "$la" ] || continue
+    LINK_TTY_A+=("$la"); LINK_TTY_B+=("$lb"); LINK_COLOR_IDX+=("$lc")
+  done < "$LINK_FILE"
+}
+
+save_links() {
+  : > "$LINK_FILE"
+  local i=0
+  while [ "$i" -lt "${#LINK_TTY_A[@]}" ]; do
+    printf '%s|%s|%s\n' "${LINK_TTY_A[$i]}" "${LINK_TTY_B[$i]}" "${LINK_COLOR_IDX[$i]}" >> "$LINK_FILE"
+    i=$((i + 1))
+  done
+}
+
+get_link_color() {
+  local tty="$1" i=0
+  while [ "$i" -lt "${#LINK_TTY_A[@]}" ]; do
+    if [ "${LINK_TTY_A[$i]}" = "$tty" ] || [ "${LINK_TTY_B[$i]}" = "$tty" ]; then
+      printf '%d' "${LINK_COLOR_IDX[$i]}"; return
+    fi
+    i=$((i + 1))
+  done
+  printf '%d' "-1"
+}
+
+get_link_partner() {
+  local tty="$1" i=0
+  while [ "$i" -lt "${#LINK_TTY_A[@]}" ]; do
+    if [ "${LINK_TTY_A[$i]}" = "$tty" ]; then printf '%s' "${LINK_TTY_B[$i]}"; return; fi
+    if [ "${LINK_TTY_B[$i]}" = "$tty" ]; then printf '%s' "${LINK_TTY_A[$i]}"; return; fi
+    i=$((i + 1))
+  done
+}
+
+has_link() {
+  local tty="$1" i=0
+  while [ "$i" -lt "${#LINK_TTY_A[@]}" ]; do
+    if [ "${LINK_TTY_A[$i]}" = "$tty" ] || [ "${LINK_TTY_B[$i]}" = "$tty" ]; then return 0; fi
+    i=$((i + 1))
+  done
+  return 1
+}
+
+next_link_color() {
+  local used="" i=0
+  while [ "$i" -lt "${#LINK_COLOR_IDX[@]}" ]; do
+    used="${used} ${LINK_COLOR_IDX[$i]}"
+    i=$((i + 1))
+  done
+  local c=0
+  while [ "$c" -lt "$LINK_COLOR_COUNT" ]; do
+    case " $used " in *" $c "*) ;; *) printf '%d' "$c"; return ;; esac
+    c=$((c + 1))
+  done
+  printf '%d' "0"  # wrap around if all used
+}
+
+find_agent_by_tty() {
+  local tty="$1" i=0
+  while [ "$i" -lt "$AGENT_COUNT" ]; do
+    [ "${A_TTY[$i]}" = "$tty" ] && { printf '%d' "$i"; return; }
+    i=$((i + 1))
+  done
+  printf '%d' "-1"
+}
+
+create_link() {
+  local tty_a="$1" tty_b="$2"
+  local cidx
+  cidx=$(next_link_color)
+  LINK_TTY_A+=("$tty_a"); LINK_TTY_B+=("$tty_b"); LINK_COLOR_IDX+=("$cidx")
+  save_links
+  mkdir -p "$MSG_DIR/inbox/$tty_a" "$MSG_DIR/inbox/$tty_b"
+}
+
+remove_link() {
+  local tty="$1"
+  local new_a=() new_b=() new_c=() i=0
+  while [ "$i" -lt "${#LINK_TTY_A[@]}" ]; do
+    if [ "${LINK_TTY_A[$i]}" != "$tty" ] && [ "${LINK_TTY_B[$i]}" != "$tty" ]; then
+      new_a+=("${LINK_TTY_A[$i]}"); new_b+=("${LINK_TTY_B[$i]}"); new_c+=("${LINK_COLOR_IDX[$i]}")
+    fi
+    i=$((i + 1))
+  done
+  LINK_TTY_A=("${new_a[@]}"); LINK_TTY_B=("${new_b[@]}"); LINK_COLOR_IDX=("${new_c[@]}")
+  save_links
+}
+
+prune_stale_links() {
+  local changed=0 new_a=() new_b=() new_c=() i=0
+  while [ "$i" -lt "${#LINK_TTY_A[@]}" ]; do
+    local fa fb
+    fa=$(find_agent_by_tty "${LINK_TTY_A[$i]}")
+    fb=$(find_agent_by_tty "${LINK_TTY_B[$i]}")
+    if [ "$fa" -ge 0 ] && [ "$fb" -ge 0 ]; then
+      new_a+=("${LINK_TTY_A[$i]}"); new_b+=("${LINK_TTY_B[$i]}"); new_c+=("${LINK_COLOR_IDX[$i]}")
+    else
+      changed=1
+    fi
+    i=$((i + 1))
+  done
+  if [ "$changed" -eq 1 ]; then
+    LINK_TTY_A=("${new_a[@]}"); LINK_TTY_B=("${new_b[@]}"); LINK_COLOR_IDX=("${new_c[@]}")
+    save_links
+  fi
+}
+
+inject_link_context() {
+  local tty_a="$1" tty_b="$2"
+  local idx_a idx_b
+  idx_a=$(find_agent_by_tty "$tty_a")
+  idx_b=$(find_agent_by_tty "$tty_b")
+  [ "$idx_a" -lt 0 ] || [ "$idx_b" -lt 0 ] && return
+
+  local pane_a="${AGENT_PANE_IDS[$idx_a]}" pane_b="${AGENT_PANE_IDS[$idx_b]}"
+  local sess_a="${AGENT_SESSIONS[$idx_a]}" sess_b="${AGENT_SESSIONS[$idx_b]}"
+  local win_a="${A_WIN[$idx_a]}" win_b="${A_WIN[$idx_b]}"
+  local inbox_a="$MSG_DIR/inbox/$tty_a" inbox_b="$MSG_DIR/inbox/$tty_b"
+
+  local msg_to_a="You are now linked with another Claude agent running in ${sess_b}/${win_b}. To send it a message, write a file to ${inbox_b}/ using: echo 'your message' > ${inbox_b}/\$(date +%s).msg — Messages from it will appear as prompts to you automatically. Keep messages concise and actionable."
+  local msg_to_b="You are now linked with another Claude agent running in ${sess_a}/${win_a}. To send it a message, write a file to ${inbox_a}/ using: echo 'your message' > ${inbox_a}/\$(date +%s).msg — Messages from it will appear as prompts to you automatically. Keep messages concise and actionable."
+
+  local state_a="${A_STATE[$idx_a]}" state_b="${A_STATE[$idx_b]}"
+
+  if [ "$state_a" = "waiting" ] || [ "$state_a" = "idle" ]; then
+    tmux send-keys -t "$pane_a" -l "$msg_to_a"
+    tmux send-keys -t "$pane_a" Enter
+  else
+    printf '%s\n' "$msg_to_a" > "${inbox_a}/$(date +%s)-link-init.msg"
+  fi
+
+  if [ "$state_b" = "waiting" ] || [ "$state_b" = "idle" ]; then
+    tmux send-keys -t "$pane_b" -l "$msg_to_b"
+    tmux send-keys -t "$pane_b" Enter
+  else
+    printf '%s\n' "$msg_to_b" > "${inbox_b}/$(date +%s)-link-init.msg"
+  fi
+}
+
+deliver_pending_messages() {
+  [ -d "$MSG_DIR/inbox" ] || return
+  local i=0
+  while [ "$i" -lt "$AGENT_COUNT" ]; do
+    local tty="${A_TTY[$i]}" state="${A_STATE[$i]}"
+    local inbox="$MSG_DIR/inbox/$tty"
+
+    if [ "$state" = "waiting" ] || [ "$state" = "idle" ]; then
+      if [ -d "$inbox" ]; then
+        for msgfile in "$inbox"/*.msg; do
+          [ -f "$msgfile" ] || continue
+          local content pane_id="${AGENT_PANE_IDS[$i]}"
+          content=$(cat "$msgfile")
+          if [ -n "$pane_id" ] && [ -n "$content" ]; then
+            local partner_sess="" partner_win=""
+            local partner_tty
+            partner_tty=$(get_link_partner "$tty")
+            if [ -n "$partner_tty" ]; then
+              local pidx
+              pidx=$(find_agent_by_tty "$partner_tty")
+              if [ "$pidx" -ge 0 ]; then
+                partner_sess="${AGENT_SESSIONS[$pidx]}"
+                partner_win="${A_WIN[$pidx]}"
+              fi
+            fi
+            local prefix=""
+            [ -n "$partner_sess" ] && prefix="Message from linked agent (${partner_sess}/${partner_win}): "
+            tmux send-keys -t "$pane_id" -l "${prefix}${content}"
+            tmux send-keys -t "$pane_id" Enter
+            mkdir -p "$MSG_DIR/delivered"
+            mv "$msgfile" "$MSG_DIR/delivered/"
+            local now_time
+            now_time=$(date +%H:%M:%S)
+            EVENT_LOG+=("${now_time} ${AGENT_SESSIONS[$i]}/${A_WIN[$i]}: 📨 message delivered")
+            save_event_log
+          fi
+          break  # one message per refresh cycle to avoid flooding
+        done
+      fi
+    fi
+    i=$((i + 1))
+  done
+}
+
 load_event_log() {
   EVENT_LOG=()
   [ -f "$EVENT_LOG_FILE" ] || return
@@ -657,6 +1276,394 @@ save_event_log() {
   while [ "$i" -lt "${#EVENT_LOG[@]}" ]; do
     printf '%s\n' "${EVENT_LOG[$i]}" >> "$EVENT_LOG_FILE"
     i=$((i + 1))
+  done
+}
+
+# ── Task tracker helpers ──────────────────────────────────────────────
+
+count_tasks() {
+  local n
+  n=$(grep -c '^## ' "$1" 2>/dev/null) || true
+  printf '%d' "${n:-0}"
+}
+
+# Populate TASK_DESCS array with ## titles from a tracker file
+load_task_descriptions() {
+  TASK_DESCS=()
+  local file="$1"
+  [ -f "$file" ] || return
+  while IFS= read -r line; do
+    TASK_DESCS+=("${line#\#\# }")
+  done < <(grep '^## ' "$file")
+}
+
+# Get the line number (1-indexed) of the Nth task (0-indexed) in a file
+task_line_number() {
+  local file="$1" idx="$2"
+  awk -v n="$idx" '/^## / { if (c++ == n) { print NR; exit } }' "$file"
+}
+
+# Extract a full task block (## heading through to next ## or EOF)
+get_task_block() {
+  local file="$1" start="$2"
+  awk -v s="$start" '
+    NR == s { found=1; print; next }
+    found && /^## / { exit }
+    found { print }
+  ' "$file"
+}
+
+# Extract just the prompt body (skip ## title and > metadata lines, trim leading/trailing blanks)
+get_task_prompt() {
+  local file="$1" start="$2"
+  awk -v s="$start" '
+    NR == s { found=1; next }
+    found && /^## / { exit }
+    found && /^> / { next }
+    found { buf = buf $0 "\n" }
+    END {
+      # Trim leading and trailing blank lines
+      sub(/^\n+/, "", buf)
+      sub(/\n+$/, "", buf)
+      if (buf != "") print buf
+    }
+  ' "$file"
+}
+
+# Remove a task block starting at a line number (atomic via tmp file)
+remove_task_block() {
+  local file="$1" start="$2"
+  awk -v s="$start" '
+    NR == s { skip=1; next }
+    skip && !/^## / { next }
+    skip && /^## / { skip=0 }
+    { print }
+  ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+}
+
+# Append a task block to a file, optionally inserting a > metadata line after the title
+append_task_to() {
+  local file="$1" block="$2" meta="$3"
+  if [ -n "$meta" ]; then
+    # Insert > metadata line right after the ## heading
+    local title body
+    title=$(printf '%s\n' "$block" | head -1)
+    body=$(printf '%s\n' "$block" | tail -n +2)
+    printf '\n%s\n> %s\n%s\n' "$title" "$meta" "$body" >> "$file"
+  else
+    printf '\n%s\n' "$block" >> "$file"
+  fi
+}
+
+# Move a task from one tracker file to another with optional metadata
+move_task() {
+  local from="$1" to="$2" task_idx="$3" meta="$4"
+  local lnum
+  lnum=$(task_line_number "$from" "$task_idx")
+  [ -z "$lnum" ] && return 1
+  local block
+  block=$(get_task_block "$from" "$lnum")
+  [ -z "$block" ] && return 1
+  remove_task_block "$from" "$lnum"
+  append_task_to "$to" "$block" "$meta"
+}
+
+# Look up the task title assigned to a given session/window from IN_PROGRESS
+task_for_agent() {
+  local pane_id="$1"
+  local ip_file="$TRACKER_DIR/IN_PROGRESS.md"
+  [ -f "$ip_file" ] || return
+  local match_line
+  match_line=$(grep -n "^> assigned:.*${pane_id} " "$ip_file" 2>/dev/null | head -1 | cut -d: -f1)
+  [ -n "$match_line" ] || return
+  awk -v m="$match_line" 'NR == m-1 && /^## / { sub(/^## /, ""); print }' "$ip_file"
+}
+
+# ── Tracker UI ────────────────────────────────────────────────────────
+
+open_tracker() {
+  clear
+  tput cnorm 2>/dev/null
+  printf "\n"
+  printf "  ${BOLD}Tracker${RESET}\n\n"
+
+  local i=0
+  for tf in "${TRACKER_STAGES[@]}"; do
+    i=$((i + 1))
+    local name="${tf%.md}"
+    local count
+    count=$(count_tasks "$TRACKER_DIR/$tf")
+    printf "  ${BOLD}%d${RESET}  %-15s ${DIM}(%d)${RESET}\n" "$i" "$name" "$count"
+  done
+  printf "  ${DIM}─${RESET}\n"
+  printf "  ${BOLD}o${RESET}  Overview\n"
+  printf "\n"
+  printf "  ${DIM}[1-4/o] Open  [Esc] Cancel${RESET}\n"
+
+  local ch
+  IFS= read -rsn1 ch
+  case "$ch" in
+    [1-4])
+      local idx=$((ch - 1))
+      "${EDITOR:-vim}" "$TRACKER_DIR/${TRACKER_STAGES[$idx]}"
+      ;;
+    o) show_tracker_overview ;;
+  esac
+  tput civis 2>/dev/null
+}
+
+show_tracker_overview() {
+  local sel=0
+  # Collapsed state: 0=expanded, 1=collapsed (indices: 0=BACKLOG 1=TODO 2=IN_PROGRESS 3=DONE)
+  local col_0=1 col_1=0 col_2=0 col_3=1  # BACKLOG and DONE collapsed by default
+
+  while true; do
+    # ── Load task data per section ──
+    local sec_names=("BACKLOG" "TODO" "IN PROGRESS" "DONE")
+    local sec_files=("BACKLOG.md" "TODO.md" "IN_PROGRESS.md" "DONE.md")
+    local sec_counts=()
+
+    local all_descs_0=() all_descs_1=() all_descs_2=() all_descs_3=()
+    local si=0
+    while [ "$si" -lt 4 ]; do
+      load_task_descriptions "$TRACKER_DIR/${sec_files[$si]}"
+      sec_counts+=("${#TASK_DESCS[@]}")
+      local _ti=0
+      while [ "$_ti" -lt "${#TASK_DESCS[@]}" ]; do
+        eval "all_descs_${si}+=(\"\${TASK_DESCS[\$_ti]}\")"
+        _ti=$((_ti + 1))
+      done
+      si=$((si + 1))
+    done
+
+    # ── Build flat navigable list: headers + visible tasks ──
+    # Types: "header" or "task". For tasks, track section index + task index within section.
+    local nav_type=() nav_sec=() nav_tidx=() nav_desc=() nav_suffix=()
+
+    si=0
+    while [ "$si" -lt 4 ]; do
+      local collapsed
+      eval "collapsed=\$col_${si}"
+
+      # Add section header
+      nav_type+=("header")
+      nav_sec+=("$si")
+      nav_tidx+=("-1")
+      nav_desc+=("${sec_names[$si]}")
+      nav_suffix+=("")
+
+      if [ "$collapsed" -eq 0 ] && [ "${sec_counts[$si]}" -gt 0 ]; then
+        local _ti=0
+        # For DONE, only show last 5
+        local show_from=0
+        if [ "$si" -eq 3 ] && [ "${sec_counts[3]}" -gt 5 ]; then
+          show_from=$((sec_counts[3] - 5))
+        fi
+        while [ "$_ti" -lt "${sec_counts[$si]}" ]; do
+          if [ "$si" -eq 3 ] && [ "$_ti" -lt "$show_from" ]; then
+            _ti=$((_ti + 1))
+            continue
+          fi
+          local desc
+          eval "desc=\${all_descs_${si}[\$_ti]}"
+
+          local suf=""
+          if [ "$si" -eq 2 ]; then
+            # IN_PROGRESS: show assigned agent
+            local lnum
+            lnum=$(task_line_number "$TRACKER_DIR/IN_PROGRESS.md" "$_ti")
+            if [ -n "$lnum" ]; then
+              local ai
+              ai=$(awk -v s="$lnum" 'NR > s && /^> assigned:/ { sub(/^> assigned: */, ""); sub(/ *\|.*/, ""); sub(/ *%[0-9]+$/, ""); print; exit }' "$TRACKER_DIR/IN_PROGRESS.md")
+              [ -n "$ai" ] && suf="→ ${ai}"
+            fi
+          elif [ "$si" -eq 3 ]; then
+            # DONE: show completion date
+            local lnum
+            lnum=$(task_line_number "$TRACKER_DIR/DONE.md" "$_ti")
+            if [ -n "$lnum" ]; then
+              local dd
+              dd=$(awk -v s="$lnum" 'NR > s && /^> done:/ { sub(/^> done: */, ""); print; exit }' "$TRACKER_DIR/DONE.md")
+              [ -n "$dd" ] && suf="✓ ${dd}"
+            fi
+          fi
+
+          nav_type+=("task")
+          nav_sec+=("$si")
+          nav_tidx+=("$_ti")
+          nav_desc+=("$desc")
+          nav_suffix+=("$suf")
+          _ti=$((_ti + 1))
+        done
+      fi
+      si=$((si + 1))
+    done
+
+    local total=${#nav_type[@]}
+    # Clamp selection
+    [ "$sel" -ge "$total" ] && sel=$((total - 1))
+    [ "$sel" -lt 0 ] && sel=0
+
+    # Terminal width
+    local tw
+    tw=$(stty size 2>/dev/null | awk '{print $2}') || tw=80
+    [ -z "$tw" ] || [ "$tw" -eq 0 ] 2>/dev/null && tw=80
+    local dw=$((tw - 6))
+
+    # ── Render ──
+    clear
+    printf "\n"
+
+    local ri=0
+    while [ "$ri" -lt "$total" ]; do
+      local is_sel=0
+      [ "$ri" -eq "$sel" ] && is_sel=1
+
+      if [ "${nav_type[$ri]}" = "header" ]; then
+        local si_h=${nav_sec[$ri]}
+        local collapsed
+        eval "collapsed=\$col_${si_h}"
+        local arrow="▼"
+        [ "$collapsed" -eq 1 ] && arrow="▶"
+        local cnt="${sec_counts[$si_h]}"
+        local hdr="${nav_desc[$ri]}"
+
+        if [ "$is_sel" -eq 1 ]; then
+          printf "  ${X_BG_SEL}${BOLD} %s %s (%d) " "$arrow" "$hdr" "$cnt"
+          local _d=0; local fill=$((dw - ${#hdr} - ${#cnt} - 8))
+          [ "$fill" -lt 0 ] && fill=0
+          while [ "$_d" -lt "$fill" ]; do printf '─'; _d=$((_d+1)); done
+          printf " ${RESET}\n"
+        else
+          printf "  ${BOLD}  %s %s (%d) " "$arrow" "$hdr" "$cnt"
+          local _d=0; local fill=$((dw - ${#hdr} - ${#cnt} - 8))
+          [ "$fill" -lt 0 ] && fill=0
+          while [ "$_d" -lt "$fill" ]; do printf '─'; _d=$((_d+1)); done
+          printf "${RESET}\n"
+        fi
+      else
+        # Task row
+        local desc="${nav_desc[$ri]}"
+        local suf="${nav_suffix[$ri]}"
+        local si_t=${nav_sec[$ri]}
+
+        if [ "$is_sel" -eq 1 ]; then
+          printf "  ${X_BG_SEL}${BOLD}▸${RESET}${X_BG_SEL} %s" "$desc"
+          [ -n "$suf" ] && printf "  ${DIM}%s${RESET}${X_BG_SEL}" "$suf"
+          printf "${RESET}\n"
+        else
+          local style=""
+          # Dim BACKLOG and DONE tasks
+          [ "$si_t" -eq 0 ] || [ "$si_t" -eq 3 ] && style="$DIM"
+          printf "  ${style}  %s" "$desc"
+          [ -n "$suf" ] && printf "  ${DIM}%s${RESET}" "$suf"
+          printf "${RESET}\n"
+        fi
+      fi
+      ri=$((ri + 1))
+    done
+
+    printf "\n"
+    printf "  ${BOLD}j/k${RESET} Nav  ${BOLD}l/h${RESET} Expand/Collapse  ${BOLD}f${RESET} Fwd  ${BOLD}b${RESET} Back  ${BOLD}d${RESET} Done  ${BOLD}e${RESET} Edit  ${BOLD}Enter${RESET} Jump  ${BOLD}Esc${RESET} Return\n"
+
+    # ── Input ──
+    local ch
+    IFS= read -rsn1 ch
+    local ch_ord=0
+    [ -n "$ch" ] && ch_ord=$(printf '%d' "'$ch" 2>/dev/null) || ch_ord=0
+
+    # Esc / arrow keys
+    if [ "$ch_ord" -eq 27 ]; then
+      IFS= read -rsn1 -t 0.1 seq1 || true
+      if [ "$seq1" = "[" ]; then
+        IFS= read -rsn1 -t 0.1 seq2 || true
+        case "$seq2" in
+          A) sel=$((sel > 0 ? sel - 1 : 0)) ;;
+          B) sel=$((sel < total - 1 ? sel + 1 : sel)) ;;
+          C) # Right arrow — expand
+            local si_c=${nav_sec[$sel]}
+            eval "col_${si_c}=0"
+            ;;
+          D) # Left arrow — collapse
+            local si_c=${nav_sec[$sel]}
+            eval "col_${si_c}=1"
+            ;;
+        esac
+        continue
+      fi
+      return
+    fi
+
+    # Find which section the cursor is in
+    local cur_sec=${nav_sec[$sel]}
+
+    case "$ch" in
+      j|J) sel=$((sel < total - 1 ? sel + 1 : sel)) ;;
+      k|K) sel=$((sel > 0 ? sel - 1 : 0)) ;;
+      g)   sel=0 ;;
+      G)   sel=$((total - 1)) ;;
+      l)   eval "col_${cur_sec}=0" ;;  # expand
+      h)   eval "col_${cur_sec}=1" ;;  # collapse
+      f)
+        [ "${nav_type[$sel]}" = "header" ] && continue
+        local sf="${sec_files[$cur_sec]}"
+        local si_idx="${nav_tidx[$sel]}"
+        if [ "$cur_sec" -eq 0 ]; then
+          move_task "$TRACKER_DIR/$sf" "$TRACKER_DIR/TODO.md" "$si_idx" ""
+        elif [ "$cur_sec" -eq 1 ]; then
+          move_task "$TRACKER_DIR/$sf" "$TRACKER_DIR/IN_PROGRESS.md" "$si_idx" \
+            "assigned: manual | $(date '+%Y-%m-%d %H:%M')"
+        elif [ "$cur_sec" -eq 2 ]; then
+          move_task "$TRACKER_DIR/$sf" "$TRACKER_DIR/DONE.md" "$si_idx" \
+            "done: $(date '+%Y-%m-%d %H:%M')"
+        fi
+        ;;
+      b)
+        [ "${nav_type[$sel]}" = "header" ] && continue
+        local sf="${sec_files[$cur_sec]}"
+        local si_idx="${nav_tidx[$sel]}"
+        if [ "$cur_sec" -eq 2 ]; then
+          move_task "$TRACKER_DIR/$sf" "$TRACKER_DIR/TODO.md" "$si_idx" ""
+        elif [ "$cur_sec" -eq 1 ]; then
+          move_task "$TRACKER_DIR/$sf" "$TRACKER_DIR/BACKLOG.md" "$si_idx" ""
+        fi
+        ;;
+      d)
+        [ "${nav_type[$sel]}" = "header" ] && continue
+        [ "$cur_sec" -eq 3 ] && continue  # already in DONE
+        local sf="${sec_files[$cur_sec]}"
+        local si_idx="${nav_tidx[$sel]}"
+        move_task "$TRACKER_DIR/$sf" "$TRACKER_DIR/DONE.md" "$si_idx" \
+          "done: $(date '+%Y-%m-%d %H:%M')"
+        ;;
+      e)
+        # Edit the file for the section the cursor is in
+        "${EDITOR:-vim}" "$TRACKER_DIR/${sec_files[$cur_sec]}"
+        ;;
+      q) return ;;
+      "")
+        # Enter — jump to assigned agent (IN_PROGRESS tasks only)
+        [ "${nav_type[$sel]}" = "header" ] && continue
+        [ "$cur_sec" -ne 2 ] && continue  # only IN_PROGRESS
+        local si_idx="${nav_tidx[$sel]}"
+        local lnum
+        lnum=$(task_line_number "$TRACKER_DIR/IN_PROGRESS.md" "$si_idx")
+        [ -z "$lnum" ] && continue
+        # Extract pane_id (%XX) from assigned line
+        local agent_pane
+        agent_pane=$(awk -v s="$lnum" 'NR > s && /^> assigned:/ { match($0, /%[0-9]+/); if (RSTART) print substr($0, RSTART, RLENGTH); exit }' "$TRACKER_DIR/IN_PROGRESS.md")
+        [ -z "$agent_pane" ] && continue
+        # Find matching agent by pane_id
+        local ai=0
+        while [ "$ai" -lt "$AGENT_COUNT" ]; do
+          if [ "${AGENT_PANE_IDS[$ai]}" = "$agent_pane" ]; then
+            jump_to_agent "$((ai + 1))"
+            return
+          fi
+          ai=$((ai + 1))
+        done
+        ;;
+    esac
   done
 }
 
@@ -793,33 +1800,55 @@ print_agent_line() {
   local marked=0
   has_mark "${A_TTY[$idx]}" && marked=1
 
-  local mark_prefix=""
-  [ "$marked" -eq 1 ] && mark_prefix="★ "
+  local link_cidx
+  link_cidx=$(get_link_color "${A_TTY[$idx]}")
 
-  local left_len=$(( 2 + ${#row_label} + 1 + ${#mark_prefix} + 1 + 1 + ${#label} ))
+  local badge_prefix=""
+  [ "$link_cidx" -ge 0 ] && badge_prefix="⇆ "
+  [ "$marked" -eq 1 ] && badge_prefix="${badge_prefix}★ "
+
+  # Look up task title for this agent (only for thinking/waiting states)
+  local task_title=""
+  if [ "$state" = "thinking" ] || [ "$state" = "waiting" ]; then
+    task_title=$(task_for_agent "${AGENT_PANE_IDS[$idx]}")
+  fi
+
+  local left_len=$(( 2 + ${#row_label} + 1 + ${#badge_prefix} + 1 + 1 + ${#label} ))
   local gap=$(( cw - left_len - ${#up} ))
   [ "$gap" -lt 1 ] && gap=1
 
+  # If there's a task title, insert it in the gap (truncated)
+  local task_display=""
+  if [ -n "$task_title" ] && [ "$gap" -gt 6 ]; then
+    local max_task=$((gap - 3))  # leave padding around it
+    if [ "${#task_title}" -gt "$max_task" ]; then
+      task_title="${task_title:0:$((max_task - 1))}…"
+    fi
+    task_display="  ${task_title}"
+    gap=$((gap - ${#task_display}))
+    [ "$gap" -lt 1 ] && gap=1
+  fi
+
   local bg_on="" RST="$X_RESET"
-  if [ "$hl" -eq 1 ] && [ "$marked" -eq 1 ]; then
-    bg_on="$X_BG_MARK"; RST="${X_RESET}${X_BG_MARK}"
+  if [ "$link_cidx" -ge 0 ]; then
+    bg_on="${X_LINK_BG[$link_cidx]}"; RST="${X_RESET}${X_LINK_BG[$link_cidx]}"
   elif [ "$hl" -eq 1 ]; then
     bg_on="$X_BG_SEL"; RST="${X_RESET}${X_BG_SEL}"
-  elif [ "$marked" -eq 1 ]; then
-    bg_on="$X_BG_MARK_DIM"; RST="${X_RESET}${X_BG_MARK_DIM}"
   fi
 
-  local mark_display=""
-  if [ "$marked" -eq 1 ]; then
-    mark_display="${X_YELLOW}${X_BOLD}★${RST} "
+  local badge_display=""
+  if [ "$link_cidx" -ge 0 ]; then
+    badge_display="${X_LINK_FG[$link_cidx]}${X_BOLD}⇆${RST} "
   fi
+  [ "$marked" -eq 1 ] && badge_display="${badge_display}${X_YELLOW}${X_BOLD}★${RST} "
 
-  printf '%s  %s %s%s%s%s %s%s%s%s%*s%s%s%s' \
+  printf '%s  %s %s%s%s%s %s%s%s%s%s%s%*s%s%s%s' \
     "$bg_on" \
     "$row_label" \
-    "$mark_display" \
+    "$badge_display" \
     "$color" "$ic" "$RST" \
     "$color" "$X_BOLD" "$label" "$RST" \
+    "$X_DIM" "$task_display" \
     "$gap" "" \
     "$color" "$up" "$X_RESET"
 }
@@ -866,7 +1895,7 @@ print_window_header() {
   fi
 }
 
-# Print app line:  ⚡ pnpm dev
+# Print app line:  ⚡ pnpm dev / pnpm fenhogod
 # Args: app_idx card_width
 print_app_line() {
   local idx=$1 cw=$2
@@ -896,7 +1925,22 @@ render() {
   [ -z "$tw" ] || [ "$tw" -eq 0 ] 2>/dev/null && tw=80
 
   printf "${EL}\n"
-  printf "  ${BOLD}\033[7m  Agent Dashboard  ${RESET}${EL}\n"
+  if [ "$AGENT_COUNT" -gt 0 ]; then
+    local lane_summary=""
+    local li=0
+    while [ "$li" -lt "$LANE_COUNT" ]; do
+      local lc=${C_LANE_COUNTS[$li]}
+      if [ "$lc" -gt 0 ] && [ "$li" -gt 0 ]; then
+        local ll_lower
+        ll_lower=$(printf '%s' "${LANE_LABELS[$li]}" | tr '[:upper:]' '[:lower:]')
+        lane_summary="${lane_summary}  ${LANE_COLORS[$li]}${BOLD}${lc} ${ll_lower}${RESET}"
+      fi
+      li=$((li + 1))
+    done
+    printf "  ${BOLD}\033[7m  Agent Dashboard  ${RESET}${lane_summary}${EL}\n"
+  else
+    printf "  ${BOLD}\033[7m  Agent Dashboard  ${RESET}${EL}\n"
+  fi
   printf "${EL}\n"
 
   if [ "$AGENT_COUNT" -eq 0 ]; then
@@ -910,144 +1954,143 @@ render() {
     return
   fi
 
-  local total_sessions=${#SESS_NAMES[@]}
+  # Render each lane
+  local lane=0
+  while [ "$lane" -lt "$LANE_COUNT" ]; do
+    local l_off=${LANE_R_SESS_OFF[$lane]}
+    local l_nsess=${LANE_R_NSESS[$lane]}
+    local lc=${C_LANE_COUNTS[$lane]}
+    local lane_color="${LANE_COLORS[$lane]}"
 
-  # Render session columns in groups of MAX_COLS
-  local group=0
-  while [ "$group" -lt "$total_sessions" ]; do
-    local group_end=$((group + MAX_COLS))
-    [ "$group_end" -gt "$total_sessions" ] && group_end=$total_sessions
-    local ncols=$((group_end - group))
+    # Skip empty non-working lanes
+    if [ "$l_nsess" -eq 0 ] && [ "$lane" -gt 0 ]; then
+      lane=$((lane + 1)); continue
+    fi
 
-    # Column width: divide terminal evenly, shrink if too narrow
-    local cw=$(( (tw - 2) / ncols ))
-    while [ "$cw" -lt "$MIN_COL_W" ] && [ "$ncols" -gt 1 ]; do
-      ncols=$((ncols - 1))
-      cw=$(( (tw - 2) / ncols ))
-    done
-    group_end=$((group + ncols))
+    # Lane header
+    local lane_label="${LANE_LABELS[$lane]}"
+    local hdr_text="${lane_label} (${lc})"
+    local hdr_len=$((${#hdr_text} + 5))
+    local dashes=$((tw - hdr_len - 2))
+    [ "$dashes" -lt 0 ] && dashes=0
+    printf "  ${DIM}──${RESET} ${lane_color}${BOLD}${lane_label}${RESET} ${DIM}(${lc})"
+    local d=0; while [ "$d" -lt "$dashes" ]; do printf '─'; d=$((d + 1)); done
+    printf "${RESET}${EL}\n"
 
-    # Find max render lines in this group of sessions
-    local max_lines=0 c=$group
-    while [ "$c" -lt "$group_end" ]; do
-      local cnt="${RENDER_SESS_COUNT[$c]}"
-      [ "$cnt" -gt "$max_lines" ] && max_lines=$cnt
-      c=$((c + 1))
-    done
+    if [ "$l_nsess" -eq 0 ]; then
+      printf "  ${DIM}(no agents)${RESET}${EL}\n"
+      printf "${EL}\n"
+      lane=$((lane + 1)); continue
+    fi
 
-    # Session header row with productivity bar
-    c=$group
-    while [ "$c" -lt "$group_end" ]; do
-      local snum=$((c + 1))
-      local sname="${SESS_NAMES[$c]}"
-      local st="${SESS_THINKING[$c]}"
-      local sw="${SESS_WAITING[$c]}"
-      local sid="${SESS_IDLE[$c]}"
-      if [ "$c" -eq "$group" ]; then
-        printf '  '
-      fi
+    # Render session columns in groups (cap at MAX_COLS, shrink if too narrow)
+    local group=0
+    while [ "$group" -lt "$l_nsess" ]; do
+      local remaining=$((l_nsess - group))
+      local ncols=$remaining
+      [ "$ncols" -gt "$MAX_COLS" ] && ncols=$MAX_COLS
+      local cw=$(( (tw - 2) / ncols ))
+      while [ "$cw" -lt "$MIN_COL_W" ] && [ "$ncols" -gt 1 ]; do
+        ncols=$((ncols - 1))
+        cw=$(( (tw - 2) / ncols ))
+      done
+      local group_end=$((group + ncols))
 
-      # Compute suffix length: bar + space + counts
-      local suffix_len=$((st + sw + sid + 1))
-      [ "$st" -gt 0 ] && suffix_len=$((suffix_len + ${#st} + 1))
-      [ "$sw" -gt 0 ] && suffix_len=$((suffix_len + ${#sw} + 1))
-      [ "$sid" -gt 0 ] && suffix_len=$((suffix_len + ${#sid} + 1))
+      # Find max render lines in this group
+      local max_lines=0 c=$group
+      while [ "$c" -lt "$group_end" ]; do
+        local flat_idx=$((l_off + c))
+        local cnt="${LANE_R_RENDER_CNT[$flat_idx]}"
+        [ "$cnt" -gt "$max_lines" ] && max_lines=$cnt
+        c=$((c + 1))
+      done
 
-      # Truncate session name if it would overflow the column
-      local fixed_len=$(( 2 + ${#snum} + 1 + 2 ))  # "┌ N " + "  " gap
-      local max_name=$(( cw - fixed_len - suffix_len ))
-      [ "$max_name" -lt 3 ] && max_name=3
-      local dname="$sname"
-      if [ "${#dname}" -gt "$max_name" ]; then
-        dname="${dname:0:$((max_name - 1))}…"
-      fi
-
-      local prefix="┌ ${snum} ${dname}  "
-      printf "${BOLD}%s${RESET}" "$prefix"
-      local vlen=${#prefix}
-
-      # Productivity bar: green ▓ per thinking, yellow ▓ per waiting, dim ░ per idle
-      local _bi=0
-      while [ "$_bi" -lt "$st" ]; do printf "${GREEN}▓"; _bi=$((_bi+1)); done
-      _bi=0
-      while [ "$_bi" -lt "$sw" ]; do printf "${YELLOW}▓"; _bi=$((_bi+1)); done
-      _bi=0
-      while [ "$_bi" -lt "$sid" ]; do printf '\033[2m░'; _bi=$((_bi+1)); done
-      printf "${RESET} "
-      vlen=$((vlen + st + sw + sid + 1))
-
-      # State counts: 2●1◆1○
-      if [ "$st" -gt 0 ]; then printf "${GREEN}${st}●${RESET}"; vlen=$((vlen + ${#st} + 1)); fi
-      if [ "$sw" -gt 0 ]; then printf "${YELLOW}${sw}◆${RESET}"; vlen=$((vlen + ${#sw} + 1)); fi
-      if [ "$sid" -gt 0 ]; then printf '\033[2m'"${sid}○${RESET}"; vlen=$((vlen + ${#sid} + 1)); fi
-
-      local hdr_pad=$((cw - vlen))
-      [ "$hdr_pad" -lt 0 ] && hdr_pad=0
-      printf "%*s" "$hdr_pad" ""
-      c=$((c + 1))
-    done
-    printf "${EL}\n"
-
-    # Render lines — one terminal line per render item
-    local line=0
-    while [ "$line" -lt "$max_lines" ]; do
+      # Session header row
       c=$group
       while [ "$c" -lt "$group_end" ]; do
-        local r_start="${RENDER_SESS_START[$c]}"
-        local r_count="${RENDER_SESS_COUNT[$c]}"
+        local flat_idx=$((l_off + c))
+        local orig_si="${LANE_R_SESS_ORIG[$flat_idx]}"
+        local snum=$((orig_si + 1))
+        local sname="${LANE_R_SESS_NAMES[$flat_idx]}"
+        [ "$c" -eq "$group" ] && printf '  '
 
-        if [ "$c" -eq "$group" ]; then
-          printf '  '
+        local max_name=$(( cw - 2 - ${#snum} - 1 ))
+        [ "$max_name" -lt 3 ] && max_name=3
+        local dname="$sname"
+        [ "${#dname}" -gt "$max_name" ] && dname="${dname:0:$((max_name - 1))}…"
+
+        local prefix="┌ ${snum} ${dname}"
+        local envbadge=""
+        if [ -n "${SESS_ENV[$orig_si]}" ]; then
+          envbadge=" ${X_DIM}[${SESS_ENV[$orig_si]}]${X_RESET}"
         fi
-
-        if [ "$line" -lt "$r_count" ]; then
-          local ri=$((r_start + line))
-          local rtype="${RENDER_TYPE[$ri]}"
-          local ridx="${RENDER_IDX[$ri]}"
-          printf '│ '
-          local inner_w=$((cw - 3))
-
-          case "$rtype" in
-            h)
-              print_window_header "$ridx" "$inner_w" "${RENDER_BRANCH[$ri]}" "${SESS_ENV[$c]}"
-              ;;
-            a)
-              local hl=0
-              [ "$((ridx + 1))" -eq "$SELECTED" ] && hl=1
-              local snum=$((c + 1))
-              local agent_row=0 scan="${RENDER_SESS_START[$c]}"
-              while [ "$scan" -lt "$ri" ]; do
-                [ "${RENDER_TYPE[$scan]}" = "a" ] && agent_row=$((agent_row + 1))
-                scan=$((scan + 1))
-              done
-              local row_label="[${snum}$((agent_row + 1))]"
-              print_agent_line "$ridx" "$inner_w" "$hl" "$row_label"
-              ;;
-            p)
-              print_app_line "$ridx" "$inner_w"
-              ;;
-          esac
-          printf ' '
-        else
-          printf '%*s' "$cw" ""
-        fi
+        printf "${BOLD}%s${RESET}%s" "$prefix" "$envbadge"
+        local hdr_pad=$((cw - ${#prefix} - ${#SESS_ENV[$orig_si]} - 3))
+        [ -z "${SESS_ENV[$orig_si]}" ] && hdr_pad=$((cw - ${#prefix}))
+        [ "$hdr_pad" -lt 0 ] && hdr_pad=0
+        printf "%*s" "$hdr_pad" ""
         c=$((c + 1))
       done
       printf "${EL}\n"
 
-      line=$((line + 1))
+      # Render lines
+      local line=0
+      while [ "$line" -lt "$max_lines" ]; do
+        c=$group
+        while [ "$c" -lt "$group_end" ]; do
+          local flat_idx=$((l_off + c))
+          local r_start="${LANE_R_RENDER_OFF[$flat_idx]}"
+          local r_count="${LANE_R_RENDER_CNT[$flat_idx]}"
+          [ "$c" -eq "$group" ] && printf '  '
+
+          if [ "$line" -lt "$r_count" ]; then
+            local ri=$((r_start + line))
+            local rtype="${RENDER_TYPE[$ri]}"
+            local ridx="${RENDER_IDX[$ri]}"
+            printf '│ '
+            local inner_w=$((cw - 3))
+
+            case "$rtype" in
+              h) print_window_header "$ridx" "$inner_w" "${RENDER_BRANCH[$ri]}" ;;
+              a)
+                local hl=0
+                local vp
+                vp=$(vis_pos_of "$ridx")
+                [ "$((vp + 1))" -eq "$SELECTED" ] && hl=1
+                local orig_si="${LANE_R_SESS_ORIG[$flat_idx]}"
+                local snum=$((orig_si + 1))
+                local agent_pos=$((ridx - ${SESS_START[$orig_si]}))
+                local row_label="[${snum}$((agent_pos + 1))]"
+                print_agent_line "$ridx" "$inner_w" "$hl" "$row_label"
+                ;;
+              p) print_app_line "$ridx" "$inner_w" ;;
+            esac
+            printf ' '
+          else
+            printf '%*s' "$cw" ""
+          fi
+          c=$((c + 1))
+        done
+        printf "${EL}\n"
+        line=$((line + 1))
+      done
+
+      [ "$group_end" -lt "$l_nsess" ] && printf "${EL}\n"
+      group=$group_end
     done
 
-    # Blank separator between row groups of sessions
-    [ "$group_end" -lt "$total_sessions" ] && printf "${EL}\n"
-
-    group=$group_end
+    printf "${EL}\n"
+    lane=$((lane + 1))
   done
 
-  printf "${EL}\n"
   local summary_apps=""
   [ "$APP_COUNT" -gt 0 ] && summary_apps="  ${DIM}·  ${APP_COUNT} apps${RESET}"
-  printf "  ${BOLD}Total:${RESET} ${AGENT_COUNT} agents  ${GREEN}${C_THINKING} thinking${RESET}  ${YELLOW}${C_WAITING} waiting${RESET}  ${DIM}${C_IDLE} idle${RESET}${summary_apps}${EL}\n"
+  local summary_tasks=""
+  local _t_todo _t_wip
+  _t_todo=$(count_tasks "$TRACKER_DIR/TODO.md")
+  _t_wip=$(count_tasks "$TRACKER_DIR/IN_PROGRESS.md")
+  [ "$((_t_todo + _t_wip))" -gt 0 ] && summary_tasks="  ${DIM}·  ${_t_todo} todo  ${_t_wip} wip${RESET}"
+  printf "  ${BOLD}Total:${RESET} ${AGENT_COUNT} agents  ${GREEN}${C_THINKING} thinking${RESET}  ${YELLOW}${C_WAITING} waiting${RESET}  ${DIM}${C_IDLE} idle${RESET}${summary_apps}${summary_tasks}${EL}\n"
 
   # Activity feed
   if [ "${#EVENT_LOG[@]}" -gt 0 ]; then
@@ -1060,20 +2103,33 @@ render() {
   fi
 
   printf "${EL}\n"
-  printf "  ${BOLD}h/j/k/l${RESET} Nav  ${BOLD}Enter${RESET} Jump  ${BOLD}[S][R]${RESET} Direct  ${BOLD}m${RESET} Mark  ${BOLD}s${RESET} Send  ${BOLD}t${RESET} Tracker  ${BOLD}r${RESET} Refresh  ${BOLD}q${RESET} Quit${EL}\n"
+  if [ "$LINK_PENDING" -eq 1 ]; then
+    printf "  ${BOLD}${YELLOW}⇆ LINK MODE${RESET}: select second agent and press ${BOLD}L${RESET}, or ${BOLD}Esc${RESET} to cancel${EL}\n"
+  else
+    printf "  ${BOLD}j/k${RESET} ↕  ${BOLD}h/l${RESET} ↔  ${BOLD}Enter${RESET} Jump  ${BOLD}m${RESET} Mark  ${BOLD}f/b${RESET} Lane/Ship  ${BOLD}H${RESET} History  ${BOLD}L${RESET} Link  ${BOLD}s${RESET} Send  ${BOLD}n${RESET} Notes  ${BOLD}t${RESET} Tracker  ${BOLD}r${RESET} Refresh  ${BOLD}q${RESET} Quit${EL}\n"
+  fi
   printf "  ${DIM}${spin} Auto-refresh every ${REFRESH_INTERVAL}s | $(date +%H:%M:%S)${RESET}${EL}\n"
   printf "${ERASE_DOWN}"
 }
 
+vis_pos_of() {
+  local aidx=$1 i=0
+  while [ "$i" -lt "$VIS_COUNT" ]; do
+    [ "${VIS_AGENTS[$i]}" -eq "$aidx" ] && { printf '%d' "$i"; return; }
+    i=$((i + 1))
+  done
+  printf '%d' "-1"
+}
+
 jump_to_agent() {
   local num="$1"
-  [ "$num" -lt 1 ] || [ "$num" -gt "$AGENT_COUNT" ] && return
-  local idx=$((num - 1))
+  [ "$num" -lt 1 ] || [ "$num" -gt "$VIS_COUNT" ] && return
+  local aidx=${VIS_AGENTS[$((num - 1))]}
   SELECTED=$num
-  remove_notification "${A_TTY[$idx]}"
+  remove_notification "${A_TTY[$aidx]}"
   save_selected
-  local pane_id="${AGENT_PANE_IDS[$idx]}"
-  local session="${AGENT_SESSIONS[$idx]}"
+  local pane_id="${AGENT_PANE_IDS[$aidx]}"
+  local session="${AGENT_SESSIONS[$aidx]}"
   if [ -n "$pane_id" ] && [ -n "$session" ]; then
     printf 'switch-client -t "%s"\nselect-window -t "%s"\nselect-pane -t "%s"\n' \
       "$session" "$pane_id" "$pane_id" > /tmp/.claude-dashboard-jump
@@ -1082,110 +2138,139 @@ jump_to_agent() {
 }
 
 nav_down() {
-  [ "$AGENT_COUNT" -eq 0 ] && return
-  local idx=$((SELECTED - 1))
-  local cur_sess="${C_SESSIONS[$idx]}"
-  # Find end of current session
-  local sess_end=$idx
-  while [ "$sess_end" -lt $((AGENT_COUNT - 1)) ] && [ "${C_SESSIONS[$((sess_end + 1))]}" = "$cur_sess" ]; do
-    sess_end=$((sess_end + 1))
-  done
-  if [ "$idx" -lt "$sess_end" ]; then
-    SELECTED=$((idx + 2))
+  [ "$VIS_COUNT" -eq 0 ] && return
+  local info
+  info=$(_find_lane_session)
+  [ -z "$info" ] && return
+  local cur_lane l_off l_nsess lsi
+  read -r cur_lane l_off l_nsess lsi <<< "$info"
+
+  local fi=$((l_off + lsi))
+  local vs=${VIS_LSESS_START[$fi]}
+  local vc=${VIS_LSESS_COUNT[$fi]}
+  local row=$((SELECTED - 1 - vs))
+
+  if [ "$row" -lt $((vc - 1)) ]; then
+    SELECTED=$((SELECTED + 1))
   else
-    # Wrap to top of same session
-    local sess_start=$idx
-    while [ "$sess_start" -gt 0 ] && [ "${C_SESSIONS[$((sess_start - 1))]}" = "$cur_sess" ]; do
-      sess_start=$((sess_start - 1))
+    # Bottom of column — go to same column position in next lane
+    local try=1
+    while [ "$try" -lt "$LANE_COUNT" ]; do
+      local next_lane=$(( (cur_lane + try) % LANE_COUNT ))
+      local nl_off=${LANE_R_SESS_OFF[$next_lane]}
+      local nl_nsess=${LANE_R_NSESS[$next_lane]}
+      if [ "$nl_nsess" -gt 0 ]; then
+        local target_col=$lsi
+        [ "$target_col" -ge "$nl_nsess" ] && target_col=$((nl_nsess - 1))
+        local nfi=$((nl_off + target_col))
+        SELECTED=$((${VIS_LSESS_START[$nfi]} + 1))
+        return
+      fi
+      try=$((try + 1))
     done
-    SELECTED=$((sess_start + 1))
+    # Only one lane has agents — wrap to top of column
+    SELECTED=$((vs + 1))
   fi
 }
 
 nav_up() {
-  [ "$AGENT_COUNT" -eq 0 ] && return
-  local idx=$((SELECTED - 1))
-  local cur_sess="${C_SESSIONS[$idx]}"
-  # Find start of current session
-  local sess_start=$idx
-  while [ "$sess_start" -gt 0 ] && [ "${C_SESSIONS[$((sess_start - 1))]}" = "$cur_sess" ]; do
-    sess_start=$((sess_start - 1))
-  done
-  if [ "$idx" -gt "$sess_start" ]; then
-    SELECTED=$idx
+  [ "$VIS_COUNT" -eq 0 ] && return
+  local info
+  info=$(_find_lane_session)
+  [ -z "$info" ] && return
+  local cur_lane l_off l_nsess lsi
+  read -r cur_lane l_off l_nsess lsi <<< "$info"
+
+  local fi=$((l_off + lsi))
+  local vs=${VIS_LSESS_START[$fi]}
+  local vc=${VIS_LSESS_COUNT[$fi]}
+  local row=$((SELECTED - 1 - vs))
+
+  if [ "$row" -gt 0 ]; then
+    SELECTED=$((SELECTED - 1))
   else
-    # Wrap to bottom of same session
-    local sess_end=$idx
-    while [ "$sess_end" -lt $((AGENT_COUNT - 1)) ] && [ "${C_SESSIONS[$((sess_end + 1))]}" = "$cur_sess" ]; do
-      sess_end=$((sess_end + 1))
+    # Top of column — go to same column position in previous lane
+    local try=1
+    while [ "$try" -lt "$LANE_COUNT" ]; do
+      local prev_lane=$(( (cur_lane - try + LANE_COUNT) % LANE_COUNT ))
+      local pl_off=${LANE_R_SESS_OFF[$prev_lane]}
+      local pl_nsess=${LANE_R_NSESS[$prev_lane]}
+      if [ "$pl_nsess" -gt 0 ]; then
+        local target_col=$lsi
+        [ "$target_col" -ge "$pl_nsess" ] && target_col=$((pl_nsess - 1))
+        local pfi=$((pl_off + target_col))
+        SELECTED=$((${VIS_LSESS_START[$pfi]} + ${VIS_LSESS_COUNT[$pfi]}))
+        return
+      fi
+      try=$((try + 1))
     done
-    SELECTED=$((sess_end + 1))
+    # Only one lane has agents — wrap to bottom of column
+    SELECTED=$((vs + vc))
   fi
+}
+
+# Find the lane-session flat index for the currently selected agent
+_find_lane_session() {
+  local aidx=${VIS_AGENTS[$((SELECTED - 1))]}
+  local cur_lane=${A_LANE[$aidx]}
+  local l_off=${LANE_R_SESS_OFF[$cur_lane]}
+  local l_nsess=${LANE_R_NSESS[$cur_lane]}
+  local lsi=0
+  while [ "$lsi" -lt "$l_nsess" ]; do
+    local fi=$((l_off + lsi))
+    local vs=${VIS_LSESS_START[$fi]}
+    local vc=${VIS_LSESS_COUNT[$fi]}
+    if [ "$((SELECTED - 1))" -ge "$vs" ] && [ "$((SELECTED - 1))" -lt "$((vs + vc))" ]; then
+      printf '%d %d %d %d' "$cur_lane" "$l_off" "$l_nsess" "$lsi"
+      return
+    fi
+    lsi=$((lsi + 1))
+  done
 }
 
 nav_left() {
-  [ "$AGENT_COUNT" -eq 0 ] && return
-  local idx=$((SELECTED - 1))
-  local cur_sess="${C_SESSIONS[$idx]}"
-  # Find start of current session and current row
-  local sess_start=$idx
-  while [ "$sess_start" -gt 0 ] && [ "${C_SESSIONS[$((sess_start - 1))]}" = "$cur_sess" ]; do
-    sess_start=$((sess_start - 1))
-  done
-  local row=$((idx - sess_start))
-  # Find previous session
-  if [ "$sess_start" -eq 0 ]; then
-    # Wrap to last session
-    local prev_end=$((AGENT_COUNT - 1))
-  else
-    local prev_end=$((sess_start - 1))
-  fi
-  local prev_sess="${C_SESSIONS[$prev_end]}"
-  local prev_start=$prev_end
-  while [ "$prev_start" -gt 0 ] && [ "${C_SESSIONS[$((prev_start - 1))]}" = "$prev_sess" ]; do
-    prev_start=$((prev_start - 1))
-  done
-  local prev_count=$((prev_end - prev_start + 1))
-  # Clamp row if target session is shorter
-  [ "$row" -ge "$prev_count" ] && row=$((prev_count - 1))
-  SELECTED=$((prev_start + row + 1))
+  [ "$VIS_COUNT" -eq 0 ] && return
+  local info
+  info=$(_find_lane_session)
+  [ -z "$info" ] && return
+  local cur_lane l_off l_nsess lsi
+  read -r cur_lane l_off l_nsess lsi <<< "$info"
+  [ "$l_nsess" -le 1 ] && return
+
+  local fi=$((l_off + lsi))
+  local row=$((SELECTED - 1 - ${VIS_LSESS_START[$fi]}))
+
+  local prev_lsi=$(( (lsi - 1 + l_nsess) % l_nsess ))
+  local pfi=$((l_off + prev_lsi))
+  local ps_start=${VIS_LSESS_START[$pfi]}
+  local ps_count=${VIS_LSESS_COUNT[$pfi]}
+  [ "$row" -ge "$ps_count" ] && row=$((ps_count - 1))
+  SELECTED=$((ps_start + row + 1))
 }
 
 nav_right() {
-  [ "$AGENT_COUNT" -eq 0 ] && return
-  local idx=$((SELECTED - 1))
-  local cur_sess="${C_SESSIONS[$idx]}"
-  # Find start/end of current session and current row
-  local sess_start=$idx
-  while [ "$sess_start" -gt 0 ] && [ "${C_SESSIONS[$((sess_start - 1))]}" = "$cur_sess" ]; do
-    sess_start=$((sess_start - 1))
-  done
-  local sess_end=$idx
-  while [ "$sess_end" -lt $((AGENT_COUNT - 1)) ] && [ "${C_SESSIONS[$((sess_end + 1))]}" = "$cur_sess" ]; do
-    sess_end=$((sess_end + 1))
-  done
-  local row=$((idx - sess_start))
-  # Find next session
-  if [ "$sess_end" -ge $((AGENT_COUNT - 1)) ]; then
-    # Wrap to first session
-    local next_start=0
-  else
-    local next_start=$((sess_end + 1))
-  fi
-  local next_sess="${C_SESSIONS[$next_start]}"
-  local next_end=$next_start
-  while [ "$next_end" -lt $((AGENT_COUNT - 1)) ] && [ "${C_SESSIONS[$((next_end + 1))]}" = "$next_sess" ]; do
-    next_end=$((next_end + 1))
-  done
-  local next_count=$((next_end - next_start + 1))
-  # Clamp row if target session is shorter
-  [ "$row" -ge "$next_count" ] && row=$((next_count - 1))
-  SELECTED=$((next_start + row + 1))
+  [ "$VIS_COUNT" -eq 0 ] && return
+  local info
+  info=$(_find_lane_session)
+  [ -z "$info" ] && return
+  local cur_lane l_off l_nsess lsi
+  read -r cur_lane l_off l_nsess lsi <<< "$info"
+  [ "$l_nsess" -le 1 ] && return
+
+  local fi=$((l_off + lsi))
+  local row=$((SELECTED - 1 - ${VIS_LSESS_START[$fi]}))
+
+  local next_lsi=$(( (lsi + 1) % l_nsess ))
+  local nfi=$((l_off + next_lsi))
+  local ns_start=${VIS_LSESS_START[$nfi]}
+  local ns_count=${VIS_LSESS_COUNT[$nfi]}
+  [ "$row" -ge "$ns_count" ] && row=$((ns_count - 1))
+  SELECTED=$((ns_start + row + 1))
 }
 
 send_to_agent() {
-  local idx=$((SELECTED - 1))
-  [ "$idx" -lt 0 ] || [ "$idx" -ge "$AGENT_COUNT" ] && return
+  [ "$VIS_COUNT" -eq 0 ] && return
+  local idx=${VIS_AGENTS[$((SELECTED - 1))]}
 
   local pane_id="${AGENT_PANE_IDS[$idx]}"
   local session="${AGENT_SESSIONS[$idx]}"
@@ -1233,11 +2318,48 @@ send_to_agent() {
 
   printf "  ${DIM}"; _d=0; while [ "$_d" -lt "$dw" ]; do printf '─'; _d=$((_d+1)); done; printf "${RESET}\n"
   printf "\n"
-  printf "  ${BOLD}>${RESET} "
+
+  # Mode selector
+  local todo_n
+  todo_n=$(count_tasks "$TRACKER_DIR/TODO.md")
+  if [ "$todo_n" -gt 0 ]; then
+    printf "  ${BOLD}t${RESET}  Assign a task from TODO ${DIM}(%d)${RESET}\n" "$todo_n"
+  fi
+  printf "  ${BOLD}>${RESET}  Type a message\n"
+  printf "\n"
+  printf "  ${DIM}[t/>/Esc]${RESET} "
 
   tput cnorm 2>/dev/null
 
+  local mode_ch
+  IFS= read -rsn1 mode_ch
+  local mode_ord=0
+  [ -n "$mode_ch" ] && mode_ord=$(printf '%d' "'$mode_ch" 2>/dev/null) || mode_ord=0
+
+  # Esc — cancel
+  if [ "$mode_ord" -eq 27 ]; then
+    tput civis 2>/dev/null
+    FIRST_DRAW=1
+    return
+  fi
+
+  # Task mode
+  if [ "$mode_ch" = "t" ] && [ "$todo_n" -gt 0 ]; then
+    pick_and_send_task "$pane_id" "$session" "$win"
+    tput civis 2>/dev/null
+    FIRST_DRAW=1
+    return
+  fi
+
+  # Free-form mode (> or any other key starts typing)
+  printf "\r\033[K  ${BOLD}>${RESET} "
   local input=""
+  # If they pressed > we skip it; any other printable char starts the input
+  if [ "$mode_ch" != ">" ] && [ "$mode_ord" -ge 32 ]; then
+    input="$mode_ch"
+    printf '%s' "$mode_ch"
+  fi
+
   while true; do
     IFS= read -rsn1 ch
     local ch_ord=0
@@ -1282,8 +2404,63 @@ send_to_agent() {
   done
 }
 
+pick_and_send_task() {
+  local pane_id="$1" session="$2" win="$3"
+
+  load_task_descriptions "$TRACKER_DIR/TODO.md"
+  local task_count=${#TASK_DESCS[@]}
+  [ "$task_count" -eq 0 ] && return
+
+  printf "\n\n  ${BOLD}Pick a task:${RESET}\n\n"
+  local ti=0
+  local max=9
+  [ "$task_count" -lt "$max" ] && max=$task_count
+  while [ "$ti" -lt "$max" ]; do
+    printf "  ${BOLD}%d${RESET}  %s\n" "$((ti + 1))" "${TASK_DESCS[$ti]}"
+    ti=$((ti + 1))
+  done
+  printf "\n  ${DIM}[1-%d] Select  [Esc] Cancel${RESET}\n" "$max"
+
+  local ch
+  IFS= read -rsn1 ch
+  local ch_ord=0
+  [ -n "$ch" ] && ch_ord=$(printf '%d' "'$ch" 2>/dev/null) || ch_ord=0
+
+  # Esc
+  [ "$ch_ord" -eq 27 ] && return
+
+  case "$ch" in
+    [1-9])
+      local sel=$((ch - 1))
+      [ "$sel" -ge "$task_count" ] && return
+
+      # Get the prompt body (everything except ## title and > metadata)
+      local lnum
+      lnum=$(task_line_number "$TRACKER_DIR/TODO.md" "$sel")
+      local prompt
+      prompt=$(get_task_prompt "$TRACKER_DIR/TODO.md" "$lnum")
+      # Fall back to title if no body
+      [ -z "$prompt" ] && prompt="${TASK_DESCS[$sel]}"
+      # Send multi-line prompt: paste via tmux buffer, then submit
+      local tmpbuf="/tmp/.claude-task-buf.$$"
+      printf '%s' "$prompt" > "$tmpbuf"
+      tmux load-buffer "$tmpbuf"
+      tmux paste-buffer -t "$pane_id"
+      rm -f "$tmpbuf"
+      tmux send-keys -t "$pane_id" Enter
+
+      # Move from TODO → IN_PROGRESS with assignment metadata
+      move_task "$TRACKER_DIR/TODO.md" "$TRACKER_DIR/IN_PROGRESS.md" "$sel" \
+        "assigned: ${session}/${win} ${pane_id} | $(date '+%Y-%m-%d %H:%M')"
+
+      printf "\n  ${GREEN}${BOLD}✓ Task sent → IN_PROGRESS${RESET}\n"
+      sleep 0.5
+      ;;
+  esac
+}
+
 save_selected() {
-  [ "$AGENT_COUNT" -gt 0 ] && printf '%s\n' "${A_TTY[$((SELECTED - 1))]}" > "$SELECTED_FILE"
+  [ "$VIS_COUNT" -gt 0 ] && printf '%s\n' "${A_TTY[${VIS_AGENTS[$((SELECTED - 1))]}]}" > "$SELECTED_FILE"
 }
 
 restore_selected() {
@@ -1291,13 +2468,13 @@ restore_selected() {
   local saved_tty
   read -r saved_tty < "$SELECTED_FILE"
   [ -z "$saved_tty" ] && return
-  local i=0
-  while [ "$i" -lt "$AGENT_COUNT" ]; do
-    if [ "${A_TTY[$i]}" = "$saved_tty" ]; then
-      SELECTED=$((i + 1))
+  local vi=0
+  while [ "$vi" -lt "$VIS_COUNT" ]; do
+    if [ "${A_TTY[${VIS_AGENTS[$vi]}]}" = "$saved_tty" ]; then
+      SELECTED=$((vi + 1))
       return
     fi
-    i=$((i + 1))
+    vi=$((vi + 1))
   done
 }
 
@@ -1314,10 +2491,17 @@ main() {
 
   load_notifications
   load_marks
+  load_lanes
+  load_shipped
+  load_links
   fetch_agents
-  restore_selected
+  prune_stale_links
+  prune_shipped
+  prune_lanes
   build_render_items
+  restore_selected
   detect_transitions
+  deliver_pending_messages
   clear_seen_notifications
   render
 
@@ -1337,7 +2521,7 @@ main() {
       read -rsn1 -t "$REFRESH_INTERVAL" key 2>/dev/null
       local rc=$?
       if [ $rc -ne 0 ]; then
-        fetch_agents; build_render_items; detect_transitions; clear_seen_notifications; render
+        fetch_agents; prune_stale_links; prune_shipped; prune_lanes; build_render_items; detect_transitions; deliver_pending_messages; clear_seen_notifications; render
         continue
       fi
     fi
@@ -1348,28 +2532,57 @@ main() {
         key_ord=$(printf '%d' "'$key" 2>/dev/null) || key_ord=0
       fi
       if [ "$key_ord" -eq 27 ]; then
+        if [ "$LINK_PENDING" -eq 1 ]; then
+          LINK_PENDING=0; LINK_PENDING_TTY=""
+          render; continue
+        fi
         esc_state=1
         continue
       fi
       case "$key" in
         q|Q) exit 0 ;;
-        r|R) fetch_agents; build_render_items; detect_transitions; clear_seen_notifications; render ;;
+        r|R) fetch_agents; prune_stale_links; prune_shipped; prune_lanes; build_render_items; detect_transitions; deliver_pending_messages; clear_seen_notifications; render ;;
         j) nav_down; render ;;
         k) nav_up; render ;;
         h) nav_left; render ;;
         l) nav_right; render ;;
-        m) [ "$AGENT_COUNT" -gt 0 ] && toggle_mark "${A_TTY[$((SELECTED - 1))]}"; render ;;
-        s) send_to_agent; fetch_agents; build_render_items; detect_transitions; clear_seen_notifications; render ;;
-        t) tput cnorm 2>/dev/null; "${EDITOR:-vim}" "$TRACKER_FILE"; tput civis 2>/dev/null; FIRST_DRAW=1; render ;;
-        G) [ "$AGENT_COUNT" -gt 0 ] && SELECTED=$AGENT_COUNT; render ;;
+        m) [ "$VIS_COUNT" -gt 0 ] && toggle_mark "${A_TTY[${VIS_AGENTS[$((SELECTED - 1))]}]}"; render ;;
+        f) advance_quest; render ;;
+        b) retreat_quest; render ;;
+        L)
+          if [ "$VIS_COUNT" -gt 0 ]; then
+            local sel_tty="${A_TTY[${VIS_AGENTS[$((SELECTED - 1))]}]}"
+            if [ "$LINK_PENDING" -eq 1 ]; then
+              if [ "$sel_tty" != "$LINK_PENDING_TTY" ]; then
+                # Remove existing links for either agent first
+                has_link "$sel_tty" && remove_link "$sel_tty"
+                has_link "$LINK_PENDING_TTY" && remove_link "$LINK_PENDING_TTY"
+                create_link "$LINK_PENDING_TTY" "$sel_tty"
+                inject_link_context "$LINK_PENDING_TTY" "$sel_tty"
+              fi
+              LINK_PENDING=0; LINK_PENDING_TTY=""
+            else
+              if has_link "$sel_tty"; then
+                remove_link "$sel_tty"
+              else
+                LINK_PENDING=1; LINK_PENDING_TTY="$sel_tty"
+              fi
+            fi
+          fi
+          render ;;
+        s) send_to_agent; fetch_agents; prune_stale_links; prune_shipped; prune_lanes; build_render_items; detect_transitions; deliver_pending_messages; clear_seen_notifications; render ;;
+        t) show_tracker_overview; FIRST_DRAW=1; render ;;
+        n) tput cnorm 2>/dev/null; "${EDITOR:-vim}" "$NOTES_FILE"; tput civis 2>/dev/null; FIRST_DRAW=1; render ;;
+        H) [ -f "$HISTORY_FILE" ] || printf '# Shipped\n\n' > "$HISTORY_FILE"; tput cnorm 2>/dev/null; "${EDITOR:-vim}" "$HISTORY_FILE"; tput civis 2>/dev/null; FIRST_DRAW=1; render ;;
+        G) [ "$VIS_COUNT" -gt 0 ] && SELECTED=$VIS_COUNT; render ;;
         g)
           g2=""
           read -rsn1 -t 1 g2 2>/dev/null || true
-          [ "$g2" = "g" ] && [ "$AGENT_COUNT" -gt 0 ] && SELECTED=1
+          [ "$g2" = "g" ] && [ "$VIS_COUNT" -gt 0 ] && SELECTED=1
           render
           ;;
         "")
-          if [ "$AGENT_COUNT" -gt 0 ]; then
+          if [ "$VIS_COUNT" -gt 0 ]; then
             jump_to_agent "$SELECTED"
           fi
           ;;
@@ -1382,8 +2595,10 @@ main() {
               local si=$((key - 1))
               local ri=$((d2 - 1))
               if [ "$si" -lt "${#SESS_START[@]}" ] && [ "$ri" -lt "${SESS_COUNT[$si]}" ]; then
-                local target=$((SESS_START[si] + ri + 1))
-                jump_to_agent "$target"
+                local target_aidx=$((SESS_START[si] + ri))
+                local vi
+                vi=$(vis_pos_of "$target_aidx")
+                [ "$vi" -ge 0 ] && jump_to_agent "$((vi + 1))"
               fi
               ;;
           esac
