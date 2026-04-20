@@ -17,7 +17,8 @@ mkdir -p "$BIN_DIR"
 cp "$REPO_DIR/bin/claude-dashboard"  "$BIN_DIR/claude-dashboard"
 cp "$REPO_DIR/bin/claude-notify"     "$BIN_DIR/claude-notify"
 cp "$REPO_DIR/bin/claude-state-hook" "$BIN_DIR/claude-state-hook"
-chmod +x "$BIN_DIR/claude-dashboard" "$BIN_DIR/claude-notify" "$BIN_DIR/claude-state-hook"
+cp "$REPO_DIR/bin/claude-pr-tracker" "$BIN_DIR/claude-pr-tracker"
+chmod +x "$BIN_DIR/claude-dashboard" "$BIN_DIR/claude-notify" "$BIN_DIR/claude-state-hook" "$BIN_DIR/claude-pr-tracker"
 
 # Ensure ~/.local/bin is on PATH
 if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
@@ -25,8 +26,9 @@ if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
   warn "  export PATH=\"\$HOME/.local/bin:\$PATH\""
 fi
 
-# Create state directory
+# Create state and tracker directories
 mkdir -p /tmp/claude-agent-states
+mkdir -p "$HOME/.local/share/agent-monitor/tracker"
 
 # 2. Patch tmux.conf
 TMUX_CONF="$HOME/.tmux.conf"
