@@ -21,7 +21,7 @@ done
 # One-time migration: old flags → lanes (flagged agents → MY REVIEW lane)
 if [ -f "/tmp/claude-dashboard-flags" ] && [ ! -f "/tmp/claude-dashboard-lanes" ]; then
   while IFS= read -r _ftty; do
-    [ -n "$_ftty" ] && printf '%s|1\n' "$_ftty"
+    [ -n "$_ftty" ] && printf '%s|1|0\n' "$_ftty"
   done < "/tmp/claude-dashboard-flags" > "/tmp/claude-dashboard-lanes"
   rm -f "/tmp/claude-dashboard-flags"
 fi
@@ -85,6 +85,7 @@ C_IDLE=0
 A_WIN=()
 A_TTY=()
 A_CWD=()
+A_PID=()
 A_STATE_SECS=()
 
 # Activity feed & transition tracking
@@ -331,7 +332,7 @@ format_seconds() {
 
 fetch_agents() {
   AGENT_COUNT=0
-  A_STATE=(); A_WINPANE=(); A_UPTIME=(); A_WIN=(); A_TTY=(); A_CWD=(); A_STATE_SECS=()
+  A_STATE=(); A_WINPANE=(); A_UPTIME=(); A_WIN=(); A_TTY=(); A_CWD=(); A_PID=(); A_STATE_SECS=()
   BRANCH_CACHE_DIRS=(); BRANCH_CACHE_VALS=()
   C_SESSIONS=(); AGENT_PANE_IDS=(); AGENT_SESSIONS=()
   C_THINKING=0; C_WAITING=0; C_IDLE=0
@@ -431,6 +432,7 @@ fetch_agents() {
     A_TTY+=("$tty")
     A_WIN+=("${winpane%%:*}")
     A_CWD+=("$agent_cwd")
+    A_PID+=("$pid")
 
     # Time-in-current-state from state file mtime; fall back to process uptime
     local state_mtime secs_in_state=0
@@ -715,6 +717,7 @@ MARK_TTYS=()
 LANE_FILE="/tmp/claude-dashboard-lanes"
 LANE_TTYS=()
 LANE_VALS=()
+LANE_PIDS=()
 LANE_COUNT=3
 LANE_LABELS=("WORKING" "MY REVIEW" "PR REVIEW")
 X_LANE_WORKING=$(printf '\033[38;5;39m')   # bright blue
@@ -724,6 +727,7 @@ LANE_COLORS=("$X_LANE_WORKING" "$X_LANE_REVIEW" "$X_LANE_PR")
 
 SHIPPED_FILE="/tmp/claude-dashboard-shipped"
 SHIPPED_TTYS=()
+SHIPPED_PIDS=()
 
 LINK_FILE="/tmp/claude-dashboard-links"
 
@@ -816,11 +820,13 @@ toggle_mark() {
 load_lanes() {
   LANE_TTYS=()
   LANE_VALS=()
+  LANE_PIDS=()
   [ -f "$LANE_FILE" ] || return
-  while IFS='|' read -r ltty lval; do
+  while IFS='|' read -r ltty lval lpid; do
     [ -n "$ltty" ] || continue
     LANE_TTYS+=("$ltty")
     LANE_VALS+=("$lval")
+    LANE_PIDS+=("${lpid:-0}")
   done < "$LANE_FILE"
 }
 
@@ -828,7 +834,16 @@ save_lanes() {
   : > "$LANE_FILE"
   local i=0
   while [ "$i" -lt "${#LANE_TTYS[@]}" ]; do
-    printf '%s|%s\n' "${LANE_TTYS[$i]}" "${LANE_VALS[$i]}" >> "$LANE_FILE"
+    printf '%s|%s|%s\n' "${LANE_TTYS[$i]}" "${LANE_VALS[$i]}" "${LANE_PIDS[$i]:-0}" >> "$LANE_FILE"
+    i=$((i + 1))
+  done
+}
+
+# Look up current PID for a live TTY; empty if not live
+pid_for_tty() {
+  local tty="$1" i=0
+  while [ "$i" -lt "$AGENT_COUNT" ]; do
+    [ "${A_TTY[$i]}" = "$tty" ] && { printf '%s' "${A_PID[$i]}"; return; }
     i=$((i + 1))
   done
 }
@@ -847,9 +862,12 @@ get_lane() {
 
 set_lane() {
   local tty="$1" lane="$2" i=0
+  local cur_pid
+  cur_pid=$(pid_for_tty "$tty")
   while [ "$i" -lt "${#LANE_TTYS[@]}" ]; do
     if [ "${LANE_TTYS[$i]}" = "$tty" ]; then
       LANE_VALS[$i]="$lane"
+      LANE_PIDS[$i]="${cur_pid:-0}"
       save_lanes
       return
     fi
@@ -857,6 +875,7 @@ set_lane() {
   done
   LANE_TTYS+=("$tty")
   LANE_VALS+=("$lane")
+  LANE_PIDS+=("${cur_pid:-0}")
   save_lanes
 }
 
@@ -880,9 +899,12 @@ retreat_lane() {
 
 load_shipped() {
   SHIPPED_TTYS=()
+  SHIPPED_PIDS=()
   [ -f "$SHIPPED_FILE" ] || return
-  while IFS= read -r stty; do
-    [ -n "$stty" ] && SHIPPED_TTYS+=("$stty")
+  while IFS='|' read -r stty spid; do
+    [ -n "$stty" ] || continue
+    SHIPPED_TTYS+=("$stty")
+    SHIPPED_PIDS+=("${spid:-0}")
   done < "$SHIPPED_FILE"
 }
 
@@ -890,7 +912,7 @@ save_shipped() {
   : > "$SHIPPED_FILE"
   local i=0
   while [ "$i" -lt "${#SHIPPED_TTYS[@]}" ]; do
-    printf '%s\n' "${SHIPPED_TTYS[$i]}" >> "$SHIPPED_FILE"
+    printf '%s|%s\n' "${SHIPPED_TTYS[$i]}" "${SHIPPED_PIDS[$i]:-0}" >> "$SHIPPED_FILE"
     i=$((i + 1))
   done
 }
@@ -904,40 +926,47 @@ has_shipped() {
   return 1
 }
 
-# Drop entries whose TTYs are no longer live
+# Drop entries whose TTY is dead, or whose PID doesn't match (pane reused by a new process).
+# Legacy entries with pid=0 are preserved and backfilled with the current PID.
 prune_shipped() {
-  local new_list=() changed=0 i=0
+  local new_ttys=() new_pids=() changed=0 i=0
   while [ "$i" -lt "${#SHIPPED_TTYS[@]}" ]; do
-    local stty="${SHIPPED_TTYS[$i]}" live=0 j=0
-    while [ "$j" -lt "$AGENT_COUNT" ]; do
-      [ "${A_TTY[$j]}" = "$stty" ] && { live=1; break; }
-      j=$((j + 1))
-    done
-    if [ "$live" -eq 1 ]; then
-      new_list+=("$stty")
+    local stty="${SHIPPED_TTYS[$i]}" spid="${SHIPPED_PIDS[$i]:-0}"
+    local cur_pid
+    cur_pid=$(pid_for_tty "$stty")
+    if [ -z "$cur_pid" ]; then
+      changed=1
+    elif [ "$spid" = "0" ] || [ "$spid" = "$cur_pid" ]; then
+      new_ttys+=("$stty")
+      new_pids+=("$cur_pid")
+      [ "$spid" != "$cur_pid" ] && changed=1
     else
       changed=1
     fi
     i=$((i + 1))
   done
   if [ "$changed" -eq 1 ]; then
-    SHIPPED_TTYS=("${new_list[@]}")
+    SHIPPED_TTYS=("${new_ttys[@]}")
+    SHIPPED_PIDS=("${new_pids[@]}")
     save_shipped
   fi
 }
 
-# Drop lane entries whose TTYs are no longer live (so reused TTYs default to WORKING)
+# Drop lane entries whose TTY is dead or whose PID no longer matches.
+# Legacy entries with pid=0 are preserved and backfilled with the current PID.
 prune_lanes() {
-  local new_ttys=() new_vals=() changed=0 i=0
+  local new_ttys=() new_vals=() new_pids=() changed=0 i=0
   while [ "$i" -lt "${#LANE_TTYS[@]}" ]; do
-    local ltty="${LANE_TTYS[$i]}" live=0 j=0
-    while [ "$j" -lt "$AGENT_COUNT" ]; do
-      [ "${A_TTY[$j]}" = "$ltty" ] && { live=1; break; }
-      j=$((j + 1))
-    done
-    if [ "$live" -eq 1 ]; then
+    local ltty="${LANE_TTYS[$i]}" lpid="${LANE_PIDS[$i]:-0}"
+    local cur_pid
+    cur_pid=$(pid_for_tty "$ltty")
+    if [ -z "$cur_pid" ]; then
+      changed=1
+    elif [ "$lpid" = "0" ] || [ "$lpid" = "$cur_pid" ]; then
       new_ttys+=("$ltty")
       new_vals+=("${LANE_VALS[$i]}")
+      new_pids+=("$cur_pid")
+      [ "$lpid" != "$cur_pid" ] && changed=1
     else
       changed=1
     fi
@@ -946,6 +975,7 @@ prune_lanes() {
   if [ "$changed" -eq 1 ]; then
     LANE_TTYS=("${new_ttys[@]}")
     LANE_VALS=("${new_vals[@]}")
+    LANE_PIDS=("${new_pids[@]}")
     save_lanes
   fi
 }
@@ -985,11 +1015,12 @@ ship_quest() {
   [ -n "$tasks" ] && entry="${entry} — ${tasks}"
   printf '%s\n' "$entry" >> "$HISTORY_FILE"
 
-  # Mark all session agents shipped
+  # Mark all session agents shipped (with their current PIDs)
   i=0
   while [ "$i" -lt "$AGENT_COUNT" ]; do
     if [ "${AGENT_SESSIONS[$i]}" = "$session" ]; then
       SHIPPED_TTYS+=("${A_TTY[$i]}")
+      SHIPPED_PIDS+=("${A_PID[$i]}")
     fi
     i=$((i + 1))
   done
@@ -1003,11 +1034,12 @@ set_quest_lane() {
   local i=0
   while [ "$i" -lt "$AGENT_COUNT" ]; do
     if [ "${AGENT_SESSIONS[$i]}" = "$session" ]; then
-      local tty="${A_TTY[$i]}"
+      local tty="${A_TTY[$i]}" pid="${A_PID[$i]}"
       local found=0 j=0
       while [ "$j" -lt "${#LANE_TTYS[@]}" ]; do
         if [ "${LANE_TTYS[$j]}" = "$tty" ]; then
           LANE_VALS[$j]="$target"
+          LANE_PIDS[$j]="$pid"
           found=1; break
         fi
         j=$((j + 1))
@@ -1015,6 +1047,7 @@ set_quest_lane() {
       if [ "$found" -eq 0 ]; then
         LANE_TTYS+=("$tty")
         LANE_VALS+=("$target")
+        LANE_PIDS+=("$pid")
       fi
     fi
     i=$((i + 1))
