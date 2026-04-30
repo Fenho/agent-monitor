@@ -10,6 +10,7 @@ DATA_DIR="$HOME/.local/share/agent-monitor"
 TRACKER_DIR="$DATA_DIR/tracker"
 NOTES_FILE="$DATA_DIR/notes.md"
 HISTORY_FILE="$DATA_DIR/shipped.md"
+LANE_EVENTS_FILE="$DATA_DIR/lane-events.log"
 TRACKER_STAGES=("BACKLOG.md" "TODO.md" "IN_PROGRESS.md" "DONE.md")
 mkdir -p "$DATA_DIR" "$TRACKER_DIR"
 for _tf in "${TRACKER_STAGES[@]}"; do
@@ -86,10 +87,11 @@ A_WIN=()
 A_TTY=()
 A_CWD=()
 A_PID=()
+A_ETIME=()
 A_STATE_SECS=()
 
-# Activity feed & transition tracking
-EVENT_LOG=()
+# Per-agent state cache from previous render — used by detect_transitions
+# to fire bell/notification on state changes.
 PREV_A_TTY=()
 PREV_A_STATE=()
 PREV_A_MTIME=()
@@ -330,9 +332,27 @@ format_seconds() {
   fi
 }
 
+# Convert a `ps etime` string (D-HH:MM:SS / HH:MM:SS / MM:SS) to integer seconds.
+etime_to_seconds() {
+  local etime="$1"
+  local days=0 hours=0 mins=0 secs=0
+  if [[ "$etime" == *-* ]]; then
+    days="${etime%%-*}"; etime="${etime#*-}"
+  fi
+  IFS=: read -ra parts <<< "$etime"
+  local n=${#parts[@]}
+  if [ "$n" -eq 3 ]; then
+    hours="${parts[0]}"; mins="${parts[1]}"; secs="${parts[2]}"
+  elif [ "$n" -eq 2 ]; then
+    mins="${parts[0]}"; secs="${parts[1]}"
+  fi
+  days=$((10#$days)); hours=$((10#$hours)); mins=$((10#$mins)); secs=$((10#$secs))
+  echo $((days*86400 + hours*3600 + mins*60 + secs))
+}
+
 fetch_agents() {
   AGENT_COUNT=0
-  A_STATE=(); A_WINPANE=(); A_UPTIME=(); A_WIN=(); A_TTY=(); A_CWD=(); A_PID=(); A_STATE_SECS=()
+  A_STATE=(); A_WINPANE=(); A_UPTIME=(); A_WIN=(); A_TTY=(); A_CWD=(); A_PID=(); A_ETIME=(); A_STATE_SECS=()
   BRANCH_CACHE_DIRS=(); BRANCH_CACHE_VALS=()
   C_SESSIONS=(); AGENT_PANE_IDS=(); AGENT_SESSIONS=()
   C_THINKING=0; C_WAITING=0; C_IDLE=0
@@ -396,6 +416,31 @@ fetch_agents() {
   local now_epoch
   now_epoch=$(date +%s)
 
+  # Pre-scan tmux panes for agents whose hook state may be stale or wrong.
+  # Hooks only fire on UserPromptSubmit/PostToolUse/Stop/Notification, so a
+  # long reasoning chain or long-running tool can leave the file out of date.
+  # We capture the pane content for "uncertain" agents in parallel and let
+  # the main loop classify based on what's actually on screen.
+  local pane_scan_dir
+  pane_scan_dir=$(mktemp -d -t claude-pane-scan.XXXXXX 2>/dev/null) || pane_scan_dir=""
+  if [ -n "$pane_scan_dir" ]; then
+    local _scanned=0
+    while IFS='|' read -r _ss _wp _pid _cp _et _pane_id _tty _cw; do
+      local _s _mt _stale=0
+      _s=$(get_agent_state "$_tty")
+      if [ "$_s" = "thinking" ]; then
+        _mt=$(get_state_mtime "$_tty")
+        [ "$_mt" -gt 0 ] && [ $((now_epoch - _mt)) -gt 60 ] && _stale=1
+      fi
+      if [ "$_s" != "waiting" ] && { [ "$_s" != "thinking" ] || [ "$_stale" -eq 1 ]; }; then
+        local _sf="$pane_scan_dir/${_pane_id//%/}"
+        (tmux capture-pane -p -t "$_pane_id" 2>/dev/null | tail -25 > "$_sf") &
+        _scanned=$((_scanned + 1))
+      fi
+    done <<< "$joined"
+    [ "$_scanned" -gt 0 ] && wait
+  fi
+
   while IFS='|' read -r session winpane pid cpu etime pane_id tty agent_cwd; do
     [ -z "$session" ] && session="unknown"
     [ -z "$winpane" ] && winpane="?"
@@ -407,23 +452,21 @@ fetch_agents() {
     local agent_state
     agent_state=$(get_agent_state "$tty")
 
-    # Stale "thinking" override: PostToolUse fires frequently during active
-    # work, so if the state file hasn't been updated in >3 min the agent
-    # likely finished but the Stop hook didn't fire.
-    if [ "$agent_state" = "thinking" ]; then
-      local st_mtime
-      st_mtime=$(get_state_mtime "$tty")
-      if [ "$st_mtime" -gt 0 ] && [ $((now_epoch - st_mtime)) -gt 180 ]; then
-        agent_state="idle"
-      fi
-    fi
-
-    # CPU-based fallback: if state file says idle/unknown but process is
-    # burning CPU, the hook missed a transition — override to thinking
-    if [ "$agent_state" != "thinking" ] && [ "$agent_state" != "waiting" ]; then
-      local cpu_int="${cpu%.*}"
-      if [ "${cpu_int:-0}" -gt 15 ]; then
+    # Pane-content override — most reliable signal of agent activity.
+    # Active spinner lines look like "✢ Pondering… (50s · …)", whereas
+    # completed lines read "✻ Brewed for 38s" — the ellipsis + open-paren-
+    # seconds pattern only appears while a turn is in flight. "esc to
+    # interrupt" is a secondary cue (often truncated by narrow panes).
+    local scan_file=""
+    [ -n "$pane_scan_dir" ] && scan_file="$pane_scan_dir/${pane_id//%/}"
+    if [ -n "$scan_file" ] && [ -f "$scan_file" ]; then
+      if grep -qE '❯ 1\. Yes' "$scan_file"; then
+        agent_state="waiting"
+      elif grep -qE '…[[:space:]]*\([0-9]+s|esc to interrupt' "$scan_file"; then
         agent_state="thinking"
+      elif [ "$agent_state" = "thinking" ]; then
+        # Hook said thinking, mtime stale, pane shows no spinner → really idle
+        agent_state="idle"
       fi
     fi
 
@@ -433,6 +476,7 @@ fetch_agents() {
     A_WIN+=("${winpane%%:*}")
     A_CWD+=("$agent_cwd")
     A_PID+=("$pid")
+    A_ETIME+=("$etime")
 
     # Time-in-current-state from state file mtime; fall back to process uptime
     local state_mtime secs_in_state=0
@@ -544,6 +588,8 @@ fetch_agents() {
       APP_COUNT=$((APP_COUNT + 1))
     done <<< "$app_joined"
   fi
+
+  [ -n "$pane_scan_dir" ] && [ -d "$pane_scan_dir" ] && rm -rf "$pane_scan_dir"
 }
 
 build_render_items() {
@@ -554,12 +600,17 @@ build_render_items() {
   LANE_R_RENDER_OFF=(); LANE_R_RENDER_CNT=()
   VIS_LSESS_START=(); VIS_LSESS_COUNT=()
 
-  # Cache lane assignments and count per-lane agents (skip shipped)
-  C_LANE_COUNTS=(0 0 0)
+  # Cache lane assignments and count per-lane agents (skip shipped).
+  # Blocked agents are pulled out of their workflow lane into LANE_BLOCKED
+  # for rendering; their underlying workflow lane stays untouched in LANE_FILE.
+  C_LANE_COUNTS=(0 0 0 0)
   local i=0
   while [ "$i" -lt "$AGENT_COUNT" ]; do
     local _al
     _al=$(get_lane "${A_TTY[$i]}")
+    if is_blocked "${A_TTY[$i]}"; then
+      _al="$LANE_BLOCKED"
+    fi
     A_LANE+=("$_al")
     if ! has_shipped "${A_TTY[$i]}"; then
       C_LANE_COUNTS[$_al]=$(( ${C_LANE_COUNTS[$_al]} + 1 ))
@@ -640,6 +691,9 @@ build_render_items() {
         while [ "$lai" -lt "${#lane_agents[@]}" ]; do
           if [ "${A_WIN[${lane_agents[$lai]}]}" = "$wn" ]; then
             RENDER_TYPE+=("a"); RENDER_IDX+=("${lane_agents[$lai]}"); RENDER_BRANCH+=(""); lines=$((lines + 1))
+            if [ "$lane" -eq "$LANE_BLOCKED" ]; then
+              RENDER_TYPE+=("r"); RENDER_IDX+=("${lane_agents[$lai]}"); RENDER_BRANCH+=(""); lines=$((lines + 1))
+            fi
           fi
           lai=$((lai + 1))
         done
@@ -706,7 +760,6 @@ build_render_items() {
 }
 
 PREV_STATE_FILE="/tmp/claude-dashboard-prev-states"
-EVENT_LOG_FILE="/tmp/claude-dashboard-event-log"
 NOTIF_FILE="/tmp/claude-dashboard-notifs"
 SELECTED_FILE="/tmp/claude-dashboard-selected"
 NOTIF_TTYS=()
@@ -718,16 +771,26 @@ LANE_FILE="/tmp/claude-dashboard-lanes"
 LANE_TTYS=()
 LANE_VALS=()
 LANE_PIDS=()
-LANE_COUNT=3
-LANE_LABELS=("WORKING" "MY REVIEW" "PR REVIEW")
+# Total render lanes (includes BLOCKED side lane). f/b only cycles through
+# the workflow lanes (0..LANE_WORKFLOW_COUNT-1); BLOCKED is reached via x.
+LANE_COUNT=4
+LANE_WORKFLOW_COUNT=3
+LANE_BLOCKED=3
+LANE_LABELS=("WORKING" "MY REVIEW" "PR REVIEW" "BLOCKED")
 X_LANE_WORKING=$(printf '\033[38;5;39m')   # bright blue
 X_LANE_REVIEW=$(printf '\033[38;5;141m')   # lavender
 X_LANE_PR=$(printf '\033[38;5;213m')       # pink
-LANE_COLORS=("$X_LANE_WORKING" "$X_LANE_REVIEW" "$X_LANE_PR")
+X_LANE_BLOCKED=$(printf '\033[38;5;208m')  # orange
+LANE_COLORS=("$X_LANE_WORKING" "$X_LANE_REVIEW" "$X_LANE_PR" "$X_LANE_BLOCKED")
 
 SHIPPED_FILE="/tmp/claude-dashboard-shipped"
 SHIPPED_TTYS=()
 SHIPPED_PIDS=()
+
+BLOCKED_FILE="/tmp/claude-dashboard-blocked"
+BLOCKED_TTYS=()
+BLOCKED_REASONS=()
+BLOCKED_PIDS=()
 
 LINK_FILE="/tmp/claude-dashboard-links"
 
@@ -952,6 +1015,113 @@ prune_shipped() {
   fi
 }
 
+# ── Blocked agents (out-of-flow side lane) ────────────────────────────
+# Reasons are stored alongside; agent's underlying lane is preserved in
+# LANE_FILE so unblocking returns it to its original lane.
+
+load_blocked() {
+  BLOCKED_TTYS=()
+  BLOCKED_REASONS=()
+  BLOCKED_PIDS=()
+  [ -f "$BLOCKED_FILE" ] || return
+  while IFS='|' read -r btty breason bpid; do
+    [ -z "$btty" ] && continue
+    BLOCKED_TTYS+=("$btty")
+    BLOCKED_REASONS+=("$breason")
+    BLOCKED_PIDS+=("${bpid:-0}")
+  done < "$BLOCKED_FILE"
+}
+
+save_blocked() {
+  : > "$BLOCKED_FILE"
+  local i=0
+  while [ "$i" -lt "${#BLOCKED_TTYS[@]}" ]; do
+    printf '%s|%s|%s\n' "${BLOCKED_TTYS[$i]}" "${BLOCKED_REASONS[$i]}" "${BLOCKED_PIDS[$i]:-0}" >> "$BLOCKED_FILE"
+    i=$((i + 1))
+  done
+}
+
+is_blocked() {
+  local tty="$1" i=0
+  while [ "$i" -lt "${#BLOCKED_TTYS[@]}" ]; do
+    [ "${BLOCKED_TTYS[$i]}" = "$tty" ] && return 0
+    i=$((i + 1))
+  done
+  return 1
+}
+
+get_block_reason() {
+  local tty="$1" i=0
+  while [ "$i" -lt "${#BLOCKED_TTYS[@]}" ]; do
+    if [ "${BLOCKED_TTYS[$i]}" = "$tty" ]; then
+      printf '%s' "${BLOCKED_REASONS[$i]}"
+      return
+    fi
+    i=$((i + 1))
+  done
+}
+
+block_agent() {
+  local tty="$1" reason="$2" pid="$3"
+  local i=0
+  while [ "$i" -lt "${#BLOCKED_TTYS[@]}" ]; do
+    if [ "${BLOCKED_TTYS[$i]}" = "$tty" ]; then
+      BLOCKED_REASONS[$i]="$reason"
+      BLOCKED_PIDS[$i]="${pid:-0}"
+      save_blocked
+      return
+    fi
+    i=$((i + 1))
+  done
+  BLOCKED_TTYS+=("$tty")
+  BLOCKED_REASONS+=("$reason")
+  BLOCKED_PIDS+=("${pid:-0}")
+  save_blocked
+}
+
+unblock_agent() {
+  local tty="$1"
+  local new_ttys=() new_reasons=() new_pids=() i=0
+  while [ "$i" -lt "${#BLOCKED_TTYS[@]}" ]; do
+    if [ "${BLOCKED_TTYS[$i]}" != "$tty" ]; then
+      new_ttys+=("${BLOCKED_TTYS[$i]}")
+      new_reasons+=("${BLOCKED_REASONS[$i]}")
+      new_pids+=("${BLOCKED_PIDS[$i]:-0}")
+    fi
+    i=$((i + 1))
+  done
+  BLOCKED_TTYS=("${new_ttys[@]}")
+  BLOCKED_REASONS=("${new_reasons[@]}")
+  BLOCKED_PIDS=("${new_pids[@]}")
+  save_blocked
+}
+
+prune_blocked() {
+  local new_ttys=() new_reasons=() new_pids=() changed=0 i=0
+  while [ "$i" -lt "${#BLOCKED_TTYS[@]}" ]; do
+    local btty="${BLOCKED_TTYS[$i]}" bpid="${BLOCKED_PIDS[$i]:-0}"
+    local cur_pid
+    cur_pid=$(pid_for_tty "$btty")
+    if [ -z "$cur_pid" ]; then
+      changed=1
+    elif [ "$bpid" = "0" ] || [ "$bpid" = "$cur_pid" ]; then
+      new_ttys+=("$btty")
+      new_reasons+=("${BLOCKED_REASONS[$i]}")
+      new_pids+=("$cur_pid")
+      [ "$bpid" != "$cur_pid" ] && changed=1
+    else
+      changed=1
+    fi
+    i=$((i + 1))
+  done
+  if [ "$changed" -eq 1 ]; then
+    BLOCKED_TTYS=("${new_ttys[@]}")
+    BLOCKED_REASONS=("${new_reasons[@]}")
+    BLOCKED_PIDS=("${new_pids[@]}")
+    save_blocked
+  fi
+}
+
 # Drop lane entries whose TTY is dead or whose PID no longer matches.
 # Legacy entries with pid=0 are preserved and backfilled with the current PID.
 prune_lanes() {
@@ -1004,16 +1174,23 @@ ship_quest() {
     i=$((i + 1))
   done
 
-  local today now_time
+  backfill_session_start "$session"
+  local ship_epoch today now_time durations
+  ship_epoch=$(date +%s)
   today=$(date +%Y-%m-%d)
   now_time=$(date +%H:%M)
+  durations=$(compute_quest_durations "$session" "$ship_epoch")
+
   [ -f "$HISTORY_FILE" ] || printf '# Shipped\n\n' > "$HISTORY_FILE"
   if ! grep -q "^## ${today}$" "$HISTORY_FILE" 2>/dev/null; then
     printf '\n## %s\n\n' "$today" >> "$HISTORY_FILE"
   fi
   local entry="- **${now_time}** ${session}"
   [ -n "$tasks" ] && entry="${entry} — ${tasks}"
+  [ -n "$durations" ] && entry="${entry}  ⏱ ${durations}"
   printf '%s\n' "$entry" >> "$HISTORY_FILE"
+
+  prune_journal_session "$session"
 
   # Mark all session agents shipped (with their current PIDs)
   i=0
@@ -1028,9 +1205,108 @@ ship_quest() {
   build_render_items
 }
 
+# ── Lane-event journal (per-quest time tracking) ──────────────────────
+# File format: epoch|session|short_lane (W/R/PR/B)
+# Used by ship_quest to compute total + per-lane durations.
+
+lane_short() {
+  case "$1" in
+    0) echo "W" ;;
+    1) echo "R" ;;
+    2) echo "PR" ;;
+    3) echo "B" ;;
+    *) echo "?" ;;
+  esac
+}
+
+record_lane_event() {
+  local session="$1" lane_num="$2" epoch="${3:-$(date +%s)}"
+  local short
+  short=$(lane_short "$lane_num")
+  printf '%s|%s|%s\n' "$epoch" "$session" "$short" >> "$LANE_EVENTS_FILE"
+}
+
+has_journal_entry() {
+  local session="$1"
+  [ -f "$LANE_EVENTS_FILE" ] || return 1
+  grep -qF "|${session}|" "$LANE_EVENTS_FILE"
+}
+
+# Backdate the WORKING start using the longest-running agent's etime so
+# in-flight quests get reasonable totals once they ship.
+backfill_session_start() {
+  local session="$1"
+  has_journal_entry "$session" && return
+  local now max_etime=0 i=0
+  now=$(date +%s)
+  while [ "$i" -lt "$AGENT_COUNT" ]; do
+    if [ "${AGENT_SESSIONS[$i]}" = "$session" ]; then
+      local et
+      et=$(etime_to_seconds "${A_ETIME[$i]:-0}")
+      [ "$et" -gt "$max_etime" ] && max_etime=$et
+    fi
+    i=$((i + 1))
+  done
+  record_lane_event "$session" 0 "$((now - max_etime))"
+}
+
+prune_journal_session() {
+  local session="$1"
+  [ -f "$LANE_EVENTS_FILE" ] || return
+  local tmp="${LANE_EVENTS_FILE}.tmp"
+  awk -F'|' -v s="$session" '$2!=s' "$LANE_EVENTS_FILE" > "$tmp" && mv "$tmp" "$LANE_EVENTS_FILE"
+}
+
+# Returns formatted duration breakdown:
+#   "2h 14m total · W 1h 40m · R 22m · PR 12m"
+compute_quest_durations() {
+  local session="$1" ship_epoch="$2"
+  [ -f "$LANE_EVENTS_FILE" ] || return
+  local entries
+  entries=$(awk -F'|' -v s="$session" '$2==s {print $1"|"$3}' "$LANE_EVENTS_FILE" | sort -n)
+  [ -z "$entries" ] && return
+
+  local sum_W=0 sum_R=0 sum_PR=0 sum_B=0
+  local prev_epoch="" prev_lane=""
+  while IFS='|' read -r epoch lane; do
+    if [ -n "$prev_epoch" ]; then
+      local dur=$((epoch - prev_epoch))
+      [ "$dur" -lt 0 ] && dur=0
+      case "$prev_lane" in
+        W)  sum_W=$((sum_W + dur)) ;;
+        R)  sum_R=$((sum_R + dur)) ;;
+        PR) sum_PR=$((sum_PR + dur)) ;;
+        B)  sum_B=$((sum_B + dur)) ;;
+      esac
+    fi
+    prev_epoch="$epoch"; prev_lane="$lane"
+  done <<< "$entries"
+
+  if [ -n "$prev_epoch" ]; then
+    local dur=$((ship_epoch - prev_epoch))
+    [ "$dur" -lt 0 ] && dur=0
+    case "$prev_lane" in
+      W)  sum_W=$((sum_W + dur)) ;;
+      R)  sum_R=$((sum_R + dur)) ;;
+      PR) sum_PR=$((sum_PR + dur)) ;;
+      B)  sum_B=$((sum_B + dur)) ;;
+    esac
+  fi
+
+  local total=$((sum_W + sum_R + sum_PR + sum_B))
+  local parts
+  parts="$(format_seconds $total) total"
+  [ "$sum_W"  -gt 0 ] && parts="${parts} · W $(format_seconds $sum_W)"
+  [ "$sum_R"  -gt 0 ] && parts="${parts} · R $(format_seconds $sum_R)"
+  [ "$sum_PR" -gt 0 ] && parts="${parts} · PR $(format_seconds $sum_PR)"
+  [ "$sum_B"  -gt 0 ] && parts="${parts} · B $(format_seconds $sum_B)"
+  echo "$parts"
+}
+
 # Set target lane for every agent in the given session (one save)
 set_quest_lane() {
   local session="$1" target="$2"
+  backfill_session_start "$session"
   local i=0
   while [ "$i" -lt "$AGENT_COUNT" ]; do
     if [ "${AGENT_SESSIONS[$i]}" = "$session" ]; then
@@ -1053,15 +1329,46 @@ set_quest_lane() {
     i=$((i + 1))
   done
   save_lanes
+  record_lane_event "$session" "$target"
 }
 
-# Move entire quest forward: WORKING→MY REVIEW→PR REVIEW→ship
+# Block every agent in the given session under the same reason. Mirrors
+# set_quest_lane / ship_quest so a quest moves to BLOCKED as a unit.
+block_quest() {
+  local session="$1" reason="$2"
+  backfill_session_start "$session"
+  local i=0
+  while [ "$i" -lt "$AGENT_COUNT" ]; do
+    if [ "${AGENT_SESSIONS[$i]}" = "$session" ]; then
+      block_agent "${A_TTY[$i]}" "$reason" "${A_PID[$i]}"
+    fi
+    i=$((i + 1))
+  done
+  record_lane_event "$session" 3
+}
+
+unblock_quest() {
+  local session="$1"
+  local cur_lane=0 i=0
+  while [ "$i" -lt "$AGENT_COUNT" ]; do
+    if [ "${AGENT_SESSIONS[$i]}" = "$session" ]; then
+      cur_lane=$(get_lane "${A_TTY[$i]}")
+      unblock_agent "${A_TTY[$i]}"
+    fi
+    i=$((i + 1))
+  done
+  record_lane_event "$session" "$cur_lane"
+}
+
+# Move entire quest forward: WORKING→MY REVIEW→PR REVIEW→ship.
+# No-op when the agent is blocked — unblock with x first.
 advance_quest() {
   [ "$VIS_COUNT" -eq 0 ] && return
   local aidx=${VIS_AGENTS[$((SELECTED - 1))]}
   local saved_tty="${A_TTY[$aidx]}"
+  is_blocked "$saved_tty" && return
   local cur_lane=${A_LANE[$aidx]}
-  if [ "$cur_lane" -ge $((LANE_COUNT - 1)) ]; then
+  if [ "$cur_lane" -ge $((LANE_WORKFLOW_COUNT - 1)) ]; then
     ship_quest
     # Try to keep selection near where it was
     local vi=0
@@ -1086,11 +1393,13 @@ advance_quest() {
   done
 }
 
-# Move entire quest backward: PR REVIEW→MY REVIEW→WORKING, stops at WORKING
+# Move entire quest backward: PR REVIEW→MY REVIEW→WORKING, stops at WORKING.
+# No-op when the agent is blocked — unblock with x first.
 retreat_quest() {
   [ "$VIS_COUNT" -eq 0 ] && return
   local aidx=${VIS_AGENTS[$((SELECTED - 1))]}
   local saved_tty="${A_TTY[$aidx]}"
+  is_blocked "$saved_tty" && return
   local cur_lane=${A_LANE[$aidx]}
   [ "$cur_lane" -le 0 ] && return
   local target=$((cur_lane - 1))
@@ -1281,33 +1590,11 @@ deliver_pending_messages() {
             tmux send-keys -t "$pane_id" Enter
             mkdir -p "$MSG_DIR/delivered"
             mv "$msgfile" "$MSG_DIR/delivered/"
-            local now_time
-            now_time=$(date +%H:%M:%S)
-            EVENT_LOG+=("${now_time} ${AGENT_SESSIONS[$i]}/${A_WIN[$i]}: 📨 message delivered")
-            save_event_log
           fi
           break  # one message per refresh cycle to avoid flooding
         done
       fi
     fi
-    i=$((i + 1))
-  done
-}
-
-load_event_log() {
-  EVENT_LOG=()
-  [ -f "$EVENT_LOG_FILE" ] || return
-  while IFS= read -r eline; do
-    [ -n "$eline" ] || continue
-    EVENT_LOG+=("$eline")
-  done < "$EVENT_LOG_FILE"
-}
-
-save_event_log() {
-  : > "$EVENT_LOG_FILE"
-  local i=0
-  while [ "$i" -lt "${#EVENT_LOG[@]}" ]; do
-    printf '%s\n' "${EVENT_LOG[$i]}" >> "$EVENT_LOG_FILE"
     i=$((i + 1))
   done
 }
@@ -1711,47 +1998,23 @@ detect_transitions() {
     done < "$PREV_STATE_FILE"
   fi
 
-  # Load event log from file on first run
-  if [ "${#EVENT_LOG[@]}" -eq 0 ]; then
-    load_event_log
-  fi
-
-  local now_time
-  now_time=$(date +%H:%M:%S)
-  local bell=0 changed=0
+  local bell=0
   local i=0
   while [ "$i" -lt "$AGENT_COUNT" ]; do
     local tty="${A_TTY[$i]}"
     local new_state="${A_STATE[$i]}"
-    local new_mtime
-    new_mtime=$(get_state_mtime "$tty")
-    # Find previous state for this TTY
-    local prev_state="" prev_mtime="0" pi=0
+    local prev_state="" pi=0
     while [ "$pi" -lt "${#PREV_A_TTY[@]}" ]; do
       if [ "${PREV_A_TTY[$pi]}" = "$tty" ]; then
         prev_state="${PREV_A_STATE[$pi]}"
-        prev_mtime="${PREV_A_MTIME[$pi]:-0}"
         break
       fi
       pi=$((pi + 1))
     done
-    if [ -n "$prev_state" ]; then
-      local sess="${AGENT_SESSIONS[$i]}"
-      local win="${A_WIN[$i]}"
-      if [ "$prev_state" != "$new_state" ]; then
-        EVENT_LOG+=("${now_time} ${sess}/${win}: ${prev_state} → ${new_state}")
-        changed=1
-        [ "$new_state" = "waiting" ] && bell=1
-        [ "$new_state" = "idle" ] && add_notification "$tty"
-        [ "$prev_state" = "idle" ] && remove_notification "$tty"
-      elif [ "$new_mtime" != "$prev_mtime" ] && [ "$new_mtime" != "0" ]; then
-        # Same state but mtime changed — agent cycled while away
-        EVENT_LOG+=("${now_time} ${sess}/${win}: ↻ ${new_state} (updated)")
-        changed=1
-      fi
-      while [ "${#EVENT_LOG[@]}" -gt 8 ]; do
-        EVENT_LOG=("${EVENT_LOG[@]:1}")
-      done
+    if [ -n "$prev_state" ] && [ "$prev_state" != "$new_state" ]; then
+      [ "$new_state" = "waiting" ] && bell=1
+      [ "$new_state" = "idle" ] && add_notification "$tty"
+      [ "$prev_state" = "idle" ] && remove_notification "$tty"
     fi
     i=$((i + 1))
   done
@@ -1769,9 +2032,6 @@ detect_transitions() {
     printf '%s|%s|%s\n' "${A_TTY[$i]}" "${A_STATE[$i]}" "$mt" >> "$PREV_STATE_FILE"
     i=$((i + 1))
   done
-
-  # Persist event log if changed
-  [ "$changed" -eq 1 ] && save_event_log
 
   [ "$bell" -eq 1 ] && printf '\a'
 }
@@ -1886,6 +2146,31 @@ print_agent_line() {
     "$color" "$up" "$X_RESET"
 }
 
+# Print reason sub-line beneath a blocked agent's card.
+# Args: agent_idx card_width is_highlighted
+print_reason_line() {
+  local idx=$1 cw=$2 hl=$3
+  local reason
+  reason=$(get_block_reason "${A_TTY[$idx]}")
+  local prefix="      ⊘ "
+  local avail=$((cw - ${#prefix}))
+  [ "$avail" -lt 4 ] && avail=4
+  local display
+  if [ -z "$reason" ]; then
+    display="(no reason)"
+  else
+    display="$reason"
+  fi
+  if [ "${#display}" -gt "$avail" ]; then
+    display="${display:0:$((avail - 1))}…"
+  fi
+  local pad=$((avail - ${#display}))
+  [ "$pad" -lt 0 ] && pad=0
+  local bg_on=""
+  [ "$hl" -eq 1 ] && bg_on="$X_BG_SEL"
+  printf '%s%s%s%s%s%*s' "$bg_on" "$X_DIM" "$prefix" "$display" "$X_RESET" "$pad" ""
+}
+
 # Print window header: ▸ window-name  branch  ENV
 # Args: window_name card_width branch env_tag
 print_window_header() {
@@ -1962,7 +2247,7 @@ render() {
     local lane_summary=""
     local li=0
     while [ "$li" -lt "$LANE_COUNT" ]; do
-      local lc=${C_LANE_COUNTS[$li]}
+      local lc=${LANE_R_NSESS[$li]:-0}
       if [ "$lc" -gt 0 ] && [ "$li" -gt 0 ]; then
         local ll_lower
         ll_lower=$(printf '%s' "${LANE_LABELS[$li]}" | tr '[:upper:]' '[:lower:]')
@@ -1992,7 +2277,7 @@ render() {
   while [ "$lane" -lt "$LANE_COUNT" ]; do
     local l_off=${LANE_R_SESS_OFF[$lane]}
     local l_nsess=${LANE_R_NSESS[$lane]}
-    local lc=${C_LANE_COUNTS[$lane]}
+    local lc=$l_nsess
     local lane_color="${LANE_COLORS[$lane]}"
 
     # Skip empty non-working lanes
@@ -2097,6 +2382,13 @@ render() {
                 print_agent_line "$ridx" "$inner_w" "$hl" "$row_label"
                 ;;
               p) print_app_line "$ridx" "$inner_w" ;;
+              r)
+                local hl=0
+                local vp
+                vp=$(vis_pos_of "$ridx")
+                [ "$((vp + 1))" -eq "$SELECTED" ] && hl=1
+                print_reason_line "$ridx" "$inner_w" "$hl"
+                ;;
             esac
             printf ' '
           else
@@ -2125,21 +2417,11 @@ render() {
   [ "$((_t_todo + _t_wip))" -gt 0 ] && summary_tasks="  ${DIM}·  ${_t_todo} todo  ${_t_wip} wip${RESET}"
   printf "  ${BOLD}Total:${RESET} ${AGENT_COUNT} agents  ${GREEN}${C_THINKING} thinking${RESET}  ${YELLOW}${C_WAITING} waiting${RESET}  ${DIM}${C_IDLE} idle${RESET}${summary_apps}${summary_tasks}${EL}\n"
 
-  # Activity feed
-  if [ "${#EVENT_LOG[@]}" -gt 0 ]; then
-    printf "${EL}\n"
-    local ei=0
-    while [ "$ei" -lt "${#EVENT_LOG[@]}" ]; do
-      printf "  ${DIM}▹ ${EVENT_LOG[$ei]}${RESET}${EL}\n"
-      ei=$((ei + 1))
-    done
-  fi
-
   printf "${EL}\n"
   if [ "$LINK_PENDING" -eq 1 ]; then
     printf "  ${BOLD}${YELLOW}⇆ LINK MODE${RESET}: select second agent and press ${BOLD}L${RESET}, or ${BOLD}Esc${RESET} to cancel${EL}\n"
   else
-    printf "  ${BOLD}j/k${RESET} ↕  ${BOLD}h/l${RESET} ↔  ${BOLD}Enter${RESET} Jump  ${BOLD}m${RESET} Mark  ${BOLD}f/b${RESET} Lane/Ship  ${BOLD}H${RESET} History  ${BOLD}L${RESET} Link  ${BOLD}s${RESET} Send  ${BOLD}n${RESET} Notes  ${BOLD}t${RESET} Tracker  ${BOLD}r${RESET} Refresh  ${BOLD}q${RESET} Quit${EL}\n"
+    printf "  ${BOLD}j/k${RESET} ↕  ${BOLD}h/l${RESET} ↔  ${BOLD}Enter${RESET} Jump  ${BOLD}m${RESET} Mark  ${BOLD}f/b${RESET} Lane/Ship  ${BOLD}x${RESET} Block  ${BOLD}H${RESET} History  ${BOLD}L${RESET} Link  ${BOLD}s${RESET} Send  ${BOLD}n${RESET} Notes  ${BOLD}t${RESET} Tracker  ${BOLD}r${RESET} Refresh  ${BOLD}q${RESET} Quit${EL}\n"
   fi
   printf "  ${DIM}${spin} Auto-refresh every ${REFRESH_INTERVAL}s | $(date +%H:%M:%S)${RESET}${EL}\n"
   printf "${ERASE_DOWN}"
@@ -2437,6 +2719,67 @@ send_to_agent() {
   done
 }
 
+# Toggle the BLOCKED state for the currently selected quest.
+# Operates on every agent in the session so the quest moves as a unit
+# (mirrors f/b ship behavior). When blocking, prompt for an optional reason.
+toggle_block() {
+  [ "$VIS_COUNT" -eq 0 ] && return
+  local aidx=${VIS_AGENTS[$((SELECTED - 1))]}
+  local tty="${A_TTY[$aidx]}"
+  local session="${AGENT_SESSIONS[$aidx]}"
+
+  if is_blocked "$tty"; then
+    unblock_quest "$session"
+    return
+  fi
+
+  local existing
+  existing=$(get_block_reason "$tty")
+
+  clear
+  printf "\n  ${BOLD}${X_LANE_BLOCKED}Block ${session}${RESET}\n"
+  printf "  ${DIM}Why are you not taking this task? (optional, Enter to skip, Esc to cancel)${RESET}\n\n"
+  printf "  ${BOLD}>${RESET} %s" "$existing"
+
+  tput cnorm 2>/dev/null
+  local input="$existing" ch ch_ord
+  while true; do
+    IFS= read -rsn1 ch
+    ch_ord=0
+    [ -n "$ch" ] && ch_ord=$(printf '%d' "'$ch" 2>/dev/null) || ch_ord=0
+
+    # Esc — cancel
+    if [ "$ch_ord" -eq 27 ]; then
+      tput civis 2>/dev/null
+      FIRST_DRAW=1
+      return
+    fi
+
+    # Enter — commit (reason may be empty)
+    if [ -z "$ch" ]; then
+      block_quest "$session" "$input"
+      tput civis 2>/dev/null
+      FIRST_DRAW=1
+      return
+    fi
+
+    # Backspace
+    if [ "$ch_ord" -eq 127 ] || [ "$ch_ord" -eq 8 ]; then
+      if [ "${#input}" -gt 0 ]; then
+        input="${input%?}"
+        printf '\b \b'
+      fi
+      continue
+    fi
+
+    # Printable character
+    if [ "$ch_ord" -ge 32 ]; then
+      input="${input}${ch}"
+      printf '%s' "$ch"
+    fi
+  done
+}
+
 pick_and_send_task() {
   local pane_id="$1" session="$2" win="$3"
 
@@ -2526,11 +2869,13 @@ main() {
   load_marks
   load_lanes
   load_shipped
+  load_blocked
   load_links
   fetch_agents
   prune_stale_links
   prune_shipped
   prune_lanes
+  prune_blocked
   build_render_items
   restore_selected
   detect_transitions
@@ -2554,7 +2899,7 @@ main() {
       read -rsn1 -t "$REFRESH_INTERVAL" key 2>/dev/null
       local rc=$?
       if [ $rc -ne 0 ]; then
-        fetch_agents; prune_stale_links; prune_shipped; prune_lanes; build_render_items; detect_transitions; deliver_pending_messages; clear_seen_notifications; render
+        fetch_agents; prune_stale_links; prune_shipped; prune_lanes; prune_blocked; build_render_items; detect_transitions; deliver_pending_messages; clear_seen_notifications; render
         continue
       fi
     fi
@@ -2574,7 +2919,7 @@ main() {
       fi
       case "$key" in
         q|Q) exit 0 ;;
-        r|R) fetch_agents; prune_stale_links; prune_shipped; prune_lanes; build_render_items; detect_transitions; deliver_pending_messages; clear_seen_notifications; render ;;
+        r|R) fetch_agents; prune_stale_links; prune_shipped; prune_lanes; prune_blocked; build_render_items; detect_transitions; deliver_pending_messages; clear_seen_notifications; render ;;
         j) nav_down; render ;;
         k) nav_up; render ;;
         h) nav_left; render ;;
@@ -2582,6 +2927,7 @@ main() {
         m) [ "$VIS_COUNT" -gt 0 ] && toggle_mark "${A_TTY[${VIS_AGENTS[$((SELECTED - 1))]}]}"; render ;;
         f) advance_quest; render ;;
         b) retreat_quest; render ;;
+        x) toggle_block; build_render_items; render ;;
         L)
           if [ "$VIS_COUNT" -gt 0 ]; then
             local sel_tty="${A_TTY[${VIS_AGENTS[$((SELECTED - 1))]}]}"
@@ -2603,7 +2949,7 @@ main() {
             fi
           fi
           render ;;
-        s) send_to_agent; fetch_agents; prune_stale_links; prune_shipped; prune_lanes; build_render_items; detect_transitions; deliver_pending_messages; clear_seen_notifications; render ;;
+        s) send_to_agent; fetch_agents; prune_stale_links; prune_shipped; prune_lanes; prune_blocked; build_render_items; detect_transitions; deliver_pending_messages; clear_seen_notifications; render ;;
         t) show_tracker_overview; FIRST_DRAW=1; render ;;
         n) tput cnorm 2>/dev/null; "${EDITOR:-vim}" "$NOTES_FILE"; tput civis 2>/dev/null; FIRST_DRAW=1; render ;;
         H) [ -f "$HISTORY_FILE" ] || printf '# Shipped\n\n' > "$HISTORY_FILE"; tput cnorm 2>/dev/null; "${EDITOR:-vim}" "$HISTORY_FILE"; tput civis 2>/dev/null; FIRST_DRAW=1; render ;;
