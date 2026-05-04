@@ -1219,6 +1219,16 @@ lane_short() {
   esac
 }
 
+label_to_lane() {
+  case "$1" in
+    W) echo 0 ;;
+    R) echo 1 ;;
+    PR) echo 2 ;;
+    B) echo 3 ;;
+    *) echo 0 ;;
+  esac
+}
+
 record_lane_event() {
   local session="$1" lane_num="$2" epoch="${3:-$(date +%s)}"
   local short
@@ -1255,6 +1265,70 @@ prune_journal_session() {
   [ -f "$LANE_EVENTS_FILE" ] || return
   local tmp="${LANE_EVENTS_FILE}.tmp"
   awk -F'|' -v s="$session" '$2!=s' "$LANE_EVENTS_FILE" > "$tmp" && mv "$tmp" "$LANE_EVENTS_FILE"
+}
+
+# Sync new agents that joined a quest to match the quest's current lane.
+# Per-TTY storage means an agent that boots into a session already in
+# MY REVIEW would default to WORKING. We treat the existing lane file
+# entries within the session as the source of truth for the quest's
+# lane: if a session-mate is at lane N>0, mirror that. Likewise for
+# BLOCKED — inherit the block (and reason).
+sync_quest_lanes() {
+  [ "$AGENT_COUNT" -eq 0 ] && return
+
+  local lanes_changed=0
+  local i=0
+  while [ "$i" -lt "$AGENT_COUNT" ]; do
+    local tty="${A_TTY[$i]}"
+    local sess="${AGENT_SESSIONS[$i]}"
+
+    # Find the highest workflow lane among other agents in this session
+    # that have a lane file entry. Also remember a blocked session-mate.
+    local quest_lane=0
+    local mate_block_reason=""
+    local mate_blocked=0
+    local m=0
+    while [ "$m" -lt "$AGENT_COUNT" ]; do
+      if [ "${AGENT_SESSIONS[$m]}" = "$sess" ] && [ "$m" -ne "$i" ]; then
+        local other_tty="${A_TTY[$m]}"
+        local k=0
+        while [ "$k" -lt "${#LANE_TTYS[@]}" ]; do
+          if [ "${LANE_TTYS[$k]}" = "$other_tty" ]; then
+            local v="${LANE_VALS[$k]}"
+            [ "$v" -gt "$quest_lane" ] && quest_lane="$v"
+            break
+          fi
+          k=$((k + 1))
+        done
+        if [ "$mate_blocked" -eq 0 ] && is_blocked "$other_tty"; then
+          mate_blocked=1
+          mate_block_reason=$(get_block_reason "$other_tty")
+        fi
+      fi
+      m=$((m + 1))
+    done
+
+    # Patch missing lane entry if the quest is past WORKING.
+    local has_entry=0 j=0
+    while [ "$j" -lt "${#LANE_TTYS[@]}" ]; do
+      [ "${LANE_TTYS[$j]}" = "$tty" ] && { has_entry=1; break; }
+      j=$((j + 1))
+    done
+    if [ "$has_entry" -eq 0 ] && [ "$quest_lane" -gt 0 ]; then
+      LANE_TTYS+=("$tty")
+      LANE_VALS+=("$quest_lane")
+      LANE_PIDS+=("${A_PID[$i]}")
+      lanes_changed=1
+    fi
+
+    # Inherit BLOCKED if a session-mate is blocked.
+    if [ "$mate_blocked" -eq 1 ] && ! is_blocked "$tty"; then
+      block_agent "$tty" "$mate_block_reason" "${A_PID[$i]}"
+    fi
+
+    i=$((i + 1))
+  done
+  [ "$lanes_changed" -eq 1 ] && save_lanes
 }
 
 # Returns formatted duration breakdown:
@@ -2876,6 +2950,7 @@ main() {
   prune_shipped
   prune_lanes
   prune_blocked
+  sync_quest_lanes
   build_render_items
   restore_selected
   detect_transitions
@@ -2899,7 +2974,7 @@ main() {
       read -rsn1 -t "$REFRESH_INTERVAL" key 2>/dev/null
       local rc=$?
       if [ $rc -ne 0 ]; then
-        fetch_agents; prune_stale_links; prune_shipped; prune_lanes; prune_blocked; build_render_items; detect_transitions; deliver_pending_messages; clear_seen_notifications; render
+        fetch_agents; prune_stale_links; prune_shipped; prune_lanes; prune_blocked; sync_quest_lanes; build_render_items; detect_transitions; deliver_pending_messages; clear_seen_notifications; render
         continue
       fi
     fi
@@ -2919,7 +2994,7 @@ main() {
       fi
       case "$key" in
         q|Q) exit 0 ;;
-        r|R) fetch_agents; prune_stale_links; prune_shipped; prune_lanes; prune_blocked; build_render_items; detect_transitions; deliver_pending_messages; clear_seen_notifications; render ;;
+        r|R) fetch_agents; prune_stale_links; prune_shipped; prune_lanes; prune_blocked; sync_quest_lanes; build_render_items; detect_transitions; deliver_pending_messages; clear_seen_notifications; render ;;
         j) nav_down; render ;;
         k) nav_up; render ;;
         h) nav_left; render ;;
@@ -2949,7 +3024,7 @@ main() {
             fi
           fi
           render ;;
-        s) send_to_agent; fetch_agents; prune_stale_links; prune_shipped; prune_lanes; prune_blocked; build_render_items; detect_transitions; deliver_pending_messages; clear_seen_notifications; render ;;
+        s) send_to_agent; fetch_agents; prune_stale_links; prune_shipped; prune_lanes; prune_blocked; sync_quest_lanes; build_render_items; detect_transitions; deliver_pending_messages; clear_seen_notifications; render ;;
         t) show_tracker_overview; FIRST_DRAW=1; render ;;
         n) tput cnorm 2>/dev/null; "${EDITOR:-vim}" "$NOTES_FILE"; tput civis 2>/dev/null; FIRST_DRAW=1; render ;;
         H) [ -f "$HISTORY_FILE" ] || printf '# Shipped\n\n' > "$HISTORY_FILE"; tput cnorm 2>/dev/null; "${EDITOR:-vim}" "$HISTORY_FILE"; tput civis 2>/dev/null; FIRST_DRAW=1; render ;;
