@@ -27,7 +27,7 @@ if [ -f "/tmp/claude-dashboard-flags" ] && [ ! -f "/tmp/claude-dashboard-lanes" 
   rm -f "/tmp/claude-dashboard-flags"
 fi
 MAX_COLS=8
-MIN_COL_W=14
+MIN_COL_W=22
 
 # Colors & escapes
 BOLD='\033[1m'
@@ -782,6 +782,15 @@ X_LANE_REVIEW=$(printf '\033[38;5;141m')   # lavender
 X_LANE_PR=$(printf '\033[38;5;213m')       # pink
 X_LANE_BLOCKED=$(printf '\033[38;5;208m')  # orange
 LANE_COLORS=("$X_LANE_WORKING" "$X_LANE_REVIEW" "$X_LANE_PR" "$X_LANE_BLOCKED")
+# Background-color companions used by lane-header pills.
+X_LANE_BG_WORKING=$(printf '\033[48;5;24m\033[38;5;231m')   # dark blue / white
+X_LANE_BG_REVIEW=$(printf '\033[48;5;54m\033[38;5;231m')    # dark purple / white
+X_LANE_BG_PR=$(printf '\033[48;5;89m\033[38;5;231m')        # dark pink / white
+X_LANE_BG_BLOCKED=$(printf '\033[48;5;94m\033[38;5;231m')   # dark orange / white
+LANE_BGS=("$X_LANE_BG_WORKING" "$X_LANE_BG_REVIEW" "$X_LANE_BG_PR" "$X_LANE_BG_BLOCKED")
+# Card border color — neutral gray so it stays legible against any bg.
+# Lane identity is conveyed via the header pill, not the borders.
+X_BORDER=$(printf '\033[38;5;244m')
 
 SHIPPED_FILE="/tmp/claude-dashboard-shipped"
 SHIPPED_TTYS=()
@@ -2134,7 +2143,7 @@ print_agent_line() {
   local secs="${A_STATE_SECS[$idx]}"
   local ic label color
   case "$state" in
-    thinking) ic="●"; label="THINKING"; color="$X_GREEN" ;;
+    thinking) ic="${SPINNER[$SPIN_IDX]}"; label="THINKING"; color="$X_GREEN" ;;
     waiting)
       ic="◆"; label="WAITING"
       if [ "$secs" -gt 600 ]; then
@@ -2273,7 +2282,7 @@ print_window_header() {
   local pad=$((cw - used - right_len))
   [ "$pad" -lt 0 ] && pad=0
 
-  printf '%s%s%s%s' "$X_BOLD" "$X_CYAN" "$hdr" "$X_RESET"
+  printf '%s%s%s' "$X_DIM" "$hdr" "$X_RESET"
   if [ -n "$show_branch" ]; then
     printf ' %s%s%s' "$X_DIM" "$show_branch" "$X_RESET"
   fi
@@ -2292,8 +2301,10 @@ print_window_header() {
 print_app_line() {
   local idx=$1 cw=$2
   local cmd="${APP_CMD[$idx]}"
+  # `⚡` is East-Asian-Wide (2 terminal columns) but bash counts it as
+  # 1 character, so add 1 to the visible width when computing padding.
   local line="  ⚡ ${cmd}"
-  local vlen=${#line}
+  local vlen=$((${#line} + 1))
   local pad=$((cw - vlen))
   [ "$pad" -lt 0 ] && pad=0
   printf '%s%s%s%*s' "$X_DIM" "$line" "$X_RESET" "$pad" ""
@@ -2359,15 +2370,11 @@ render() {
       lane=$((lane + 1)); continue
     fi
 
-    # Lane header
+    # Lane header — filled pill with per-lane bg.
     local lane_label="${LANE_LABELS[$lane]}"
-    local hdr_text="${lane_label} (${lc})"
-    local hdr_len=$((${#hdr_text} + 5))
-    local dashes=$((tw - hdr_len - 2))
-    [ "$dashes" -lt 0 ] && dashes=0
-    printf "  ${DIM}──${RESET} ${lane_color}${BOLD}${lane_label}${RESET} ${DIM}(${lc})"
-    local d=0; while [ "$d" -lt "$dashes" ]; do printf '─'; d=$((d + 1)); done
-    printf "${RESET}${EL}\n"
+    local pill_text=" ${lane_label} · ${lc} "
+    local lane_bg="${LANE_BGS[$lane]}"
+    printf "  ${lane_bg}${X_BOLD}${pill_text}${X_RESET}${EL}\n"
 
     if [ "$l_nsess" -eq 0 ]; then
       printf "  ${DIM}(no agents)${RESET}${EL}\n"
@@ -2397,7 +2404,7 @@ render() {
         c=$((c + 1))
       done
 
-      # Session header row
+      # Top border row with rounded corners + inline session title
       c=$group
       while [ "$c" -lt "$group_end" ]; do
         local flat_idx=$((l_off + c))
@@ -2406,26 +2413,33 @@ render() {
         local sname="${LANE_R_SESS_NAMES[$flat_idx]}"
         [ "$c" -eq "$group" ] && printf '  '
 
-        local max_name=$(( cw - 2 - ${#snum} - 1 ))
-        [ "$max_name" -lt 3 ] && max_name=3
+        local env_str=""
+        [ -n "${SESS_ENV[$orig_si]}" ] && env_str=" [${SESS_ENV[$orig_si]}]"
         local dname="$sname"
-        [ "${#dname}" -gt "$max_name" ] && dname="${dname:0:$((max_name - 1))}…"
-
-        local prefix="┌ ${snum} ${dname}"
-        local envbadge=""
-        if [ -n "${SESS_ENV[$orig_si]}" ]; then
-          envbadge=" ${X_DIM}[${SESS_ENV[$orig_si]}]${X_RESET}"
+        # Budget for the visible title inside the border (between ╭─ and ─╮ ).
+        local maxT=$((cw - 6))
+        [ "$maxT" -lt 6 ] && maxT=6
+        local prefix_len=$((3 + ${#snum}))   # " <snum> "
+        local avail_for_dname=$((maxT - prefix_len - ${#env_str} - 1))
+        [ "$avail_for_dname" -lt 4 ] && avail_for_dname=4
+        if [ "${#dname}" -gt "$avail_for_dname" ]; then
+          dname="${dname:0:$((avail_for_dname - 1))}…"
         fi
-        printf "${BOLD}%s${RESET}%s" "$prefix" "$envbadge"
-        local hdr_pad=$((cw - ${#prefix} - ${#SESS_ENV[$orig_si]} - 3))
-        [ -z "${SESS_ENV[$orig_si]}" ] && hdr_pad=$((cw - ${#prefix}))
-        [ "$hdr_pad" -lt 0 ] && hdr_pad=0
-        printf "%*s" "$hdr_pad" ""
+        local title=" ${snum} ${dname}"
+        local title_vis=$((${#title} + ${#env_str} + 1))   # +1 trailing space
+        local fill=$((cw - 4 - title_vis))
+        [ "$fill" -lt 0 ] && fill=0
+
+        printf "${lane_color}╭─${X_RESET}${X_BOLD}${title}${X_RESET}${X_DIM}${env_str}${X_RESET}${lane_color} "
+        local d=0; while [ "$d" -lt "$fill" ]; do printf '─'; d=$((d + 1)); done
+        printf "╮${X_RESET} "
         c=$((c + 1))
       done
       printf "${EL}\n"
 
-      # Render lines
+      # Content rows: 0..max_lines-1. Each card draws either its content,
+      # its bottom border (when it has fewer rows than the tallest), or
+      # blank space (past its bottom border).
       local line=0
       while [ "$line" -lt "$max_lines" ]; do
         c=$group
@@ -2439,8 +2453,8 @@ render() {
             local ri=$((r_start + line))
             local rtype="${RENDER_TYPE[$ri]}"
             local ridx="${RENDER_IDX[$ri]}"
-            printf '│ '
-            local inner_w=$((cw - 3))
+            printf "${lane_color}│${X_RESET} "
+            local inner_w=$((cw - 5))
 
             case "$rtype" in
               h) print_window_header "$ridx" "$inner_w" "${RENDER_BRANCH[$ri]}" ;;
@@ -2464,7 +2478,12 @@ render() {
                 print_reason_line "$ridx" "$inner_w" "$hl"
                 ;;
             esac
-            printf ' '
+            printf " ${lane_color}│${X_RESET} "
+          elif [ "$line" -eq "$r_count" ]; then
+            # Bottom border for cards that ended before max_lines.
+            printf "${lane_color}╰"
+            local d=0; while [ "$d" -lt "$((cw - 3))" ]; do printf '─'; d=$((d + 1)); done
+            printf "╯${X_RESET} "
           else
             printf '%*s' "$cw" ""
           fi
@@ -2473,6 +2492,25 @@ render() {
         printf "${EL}\n"
         line=$((line + 1))
       done
+
+      # Final row: bottom borders for cards whose r_count == max_lines
+      # (the tallest cards in the group, which didn't get to draw their
+      # closing border inside the content loop).
+      c=$group
+      while [ "$c" -lt "$group_end" ]; do
+        local flat_idx=$((l_off + c))
+        local r_count="${LANE_R_RENDER_CNT[$flat_idx]}"
+        [ "$c" -eq "$group" ] && printf '  '
+        if [ "$r_count" -ge "$max_lines" ]; then
+          printf "${lane_color}╰"
+          local d=0; while [ "$d" -lt "$((cw - 3))" ]; do printf '─'; d=$((d + 1)); done
+          printf "╯${X_RESET} "
+        else
+          printf '%*s' "$cw" ""
+        fi
+        c=$((c + 1))
+      done
+      printf "${EL}\n"
 
       [ "$group_end" -lt "$l_nsess" ] && printf "${EL}\n"
       group=$group_end
