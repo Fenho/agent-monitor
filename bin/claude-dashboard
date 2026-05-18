@@ -2333,7 +2333,7 @@ render() {
     local li=0
     while [ "$li" -lt "$LANE_COUNT" ]; do
       local lc=${LANE_R_NSESS[$li]:-0}
-      if [ "$lc" -gt 0 ] && [ "$li" -gt 0 ]; then
+      if [ "$lc" -gt 0 ]; then
         local ll_lower
         ll_lower=$(printf '%s' "${LANE_LABELS[$li]}" | tr '[:upper:]' '[:lower:]')
         lane_summary="${lane_summary}  ${LANE_COLORS[$li]}${BOLD}${lc} ${ll_lower}${RESET}"
