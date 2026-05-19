@@ -1160,6 +1160,45 @@ prune_lanes() {
 }
 
 # Append quest to history file, mark all session agents as shipped
+# Collect distinct `sha #pr` refs for every repo touched by a quest.
+# Dedupes by cwd so multi-pane single-repo quests show one entry; multi-
+# repo quests (e.g. backend + frontend) show one per repo.
+collect_quest_refs() {
+  local session="$1"
+  local refs="" i=0
+  local seen_cwds=()
+  while [ "$i" -lt "$AGENT_COUNT" ]; do
+    if [ "${AGENT_SESSIONS[$i]}" = "$session" ]; then
+      local cwd="${A_CWD[$i]}"
+      if [ -n "$cwd" ] && [ -d "$cwd" ]; then
+        local dup=0 j=0
+        while [ "$j" -lt "${#seen_cwds[@]}" ]; do
+          [ "${seen_cwds[$j]}" = "$cwd" ] && { dup=1; break; }
+          j=$((j + 1))
+        done
+        if [ "$dup" -eq 0 ]; then
+          seen_cwds+=("$cwd")
+          local sha
+          sha=$(cd "$cwd" && git rev-parse --short HEAD 2>/dev/null)
+          if [ -n "$sha" ]; then
+            local ref="\`${sha}\`"
+            local branch
+            branch=$(cd "$cwd" && git rev-parse --abbrev-ref HEAD 2>/dev/null)
+            if [ -n "$branch" ] && [ "$branch" != "HEAD" ]; then
+              local pr
+              pr=$(cd "$cwd" && gh pr list --head "$branch" --state all --json number --jq '.[0].number' 2>/dev/null)
+              [ -n "$pr" ] && ref="${ref} #${pr}"
+            fi
+            if [ -z "$refs" ]; then refs="$ref"; else refs="${refs}, $ref"; fi
+          fi
+        fi
+      fi
+    fi
+    i=$((i + 1))
+  done
+  printf '%s' "$refs"
+}
+
 ship_quest() {
   [ "$VIS_COUNT" -eq 0 ] && return
   local aidx=${VIS_AGENTS[$((SELECTED - 1))]}
@@ -1184,11 +1223,12 @@ ship_quest() {
   done
 
   backfill_session_start "$session"
-  local ship_epoch today now_time durations
+  local ship_epoch today now_time durations refs
   ship_epoch=$(date +%s)
   today=$(date +%Y-%m-%d)
   now_time=$(date +%H:%M)
   durations=$(compute_quest_durations "$session" "$ship_epoch")
+  refs=$(collect_quest_refs "$session")
 
   [ -f "$HISTORY_FILE" ] || printf '# Shipped\n\n' > "$HISTORY_FILE"
   if ! grep -q "^## ${today}$" "$HISTORY_FILE" 2>/dev/null; then
@@ -1197,6 +1237,7 @@ ship_quest() {
   local entry="- **${now_time}** ${session}"
   [ -n "$tasks" ] && entry="${entry} — ${tasks}"
   [ -n "$durations" ] && entry="${entry}  ⏱ ${durations}"
+  [ -n "$refs" ] && entry="${entry}  → ${refs}"
   printf '%s\n' "$entry" >> "$HISTORY_FILE"
 
   prune_journal_session "$session"
