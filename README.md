@@ -2,6 +2,9 @@
 
 Kanban-style TUI for monitoring and managing Claude Code agents running across tmux sessions. One tmux session = one quest; the dashboard groups your agents by quest and moves them through swim lanes (WORKING → MY REVIEW → PR REVIEW → ship) as you make progress.
 
+<!-- Drop a screenshot of the dashboard here. -->
+![Dashboard screenshot](docs/dashboard.png)
+
 ## What it does
 
 - **Kanban dashboard** (`prefix + a`): tmux popup showing every running Claude agent as a card, grouped by lane. Vim-navigable.
